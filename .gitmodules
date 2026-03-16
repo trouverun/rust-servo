@@ -1,3 +1,4 @@
 [submodule "embassy"]
 	path = embassy
-	url = ./embassy/
+	url = https://github.com/trouverun/embassy.git
+	branch = foc
