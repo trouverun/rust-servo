@@ -1,0 +1,10 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+runner = "probe-rs run --chip STM32G473QETx"
+
+[build]
+target = "thumbv7em-none-eabihf"
+
+[alias]
+rb = "run --bin"
+rrb = "run --release --bin"
+bbr = "build --release --bin"
