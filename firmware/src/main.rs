@@ -14,91 +14,30 @@ pub mod pac {
 
 #[rtic::app(device = crate::pac, peripherals = false, dispatchers = [SPI1, SPI2, SPI3])]
 mod app {
-    use core::f32::consts::PI;
-
     use defmt::{info};
     use {defmt_rtt as _};
-    use crate::{boards::PWM_FREQ, bsp::{self, Acceleration, CurrentFeedback, HallFeedback, PhaseCurrents}};
+    use crate::bsp::{self, Acceleration, CurrentFeedback, HallFeedback, Memory, PwmOutput};
     use crate::boards::*;
-    use field_oriented::HasRotorFeedback;
     use crate::types::*;
-
-    pub struct RuntimeConfig {
-        application_state: ApplicationState,
-        control_mode: ControlMode,
-        target_velocity: f32,
-        target_torque: f32,
-    }
-
-    impl Default for RuntimeConfig {
-        fn default() -> Self {
-            Self {
-                application_state: ApplicationState::Startup,
-                control_mode: ControlMode::Velocity,
-                target_velocity: 0.0, target_torque: 0.0
-            }
-        }
-    }
+    use field_oriented::{DoesFocMath, FOC, FocConfig, FocInput, HasRotorFeedback, MotorParams, NominalParameters};
 
     #[shared]
     struct Shared {
         runtime_config: RuntimeConfig,
         hall_feedback: HallFeedback,
+        pwm_output: PwmOutput,
         acceleration: Acceleration,
+        //memory: Memory,
         debug_mappings: DebugMappings,
         button_state: ButtonState,
-    }
-
-    pub struct CalibrationState {
-        target_angle_rad: f32,
-        iteration_counter: u32,
-        settling_time_waited_s: f32,
-        prev_pattern: u8,
-        hall_pattern_to_angle: [f32; 4]
-    }
-
-    impl CalibrationState {
-        pub fn step(&mut self, hall_pattern: u8) -> f32 {
-            let angle = self.target_angle_rad;
-            if self.iteration_counter >= 1000 {
-                const TIME_PASSED: f32 = 1000.0 / PWM_FREQ.0 as f32;
-                if self.settling_time_waited_s >= 1.0 {
-                    self.target_angle_rad += 0.62 * TIME_PASSED;
-                    if self.prev_pattern != hall_pattern {
-                        self.hall_pattern_to_angle[hall_pattern.clamp(1, 4) as usize] = self.target_angle_rad;
-                    }
-                } else {
-                    self.settling_time_waited_s += TIME_PASSED;
-                    self.prev_pattern = hall_pattern;
-                }
-                self.iteration_counter = 0;
-            } else {
-                self.iteration_counter += 1;
-            }
-            angle
-        }
-
-        pub fn done(&self) -> bool {
-            self.target_angle_rad > PI
-        }
-    }
-
-    impl Default for CalibrationState {
-        fn default() -> Self {
-            Self {
-                target_angle_rad: -PI,
-                iteration_counter: 0,
-                settling_time_waited_s: 0.0,
-                prev_pattern: 0,
-                hall_pattern_to_angle: [0.0, 0.0, 0.0, 0.0]
-            }
-        }
     }
 
     #[local]
     struct Local {  
         current_feedback: CurrentFeedback,
         calibration_state: CalibrationState,
+        estimator: NominalParameters,
+        foc: FOC,
     }
 
     #[init]
@@ -109,25 +48,47 @@ mod app {
             hall_mappings, 
             pwm_mappings,
             accel_mappings,
+            memory_mappings,
             debug_mappings
         ) = map_peripherals(p);
         
         let pwm_output = bsp::PwmOutput::new(pwm_mappings);
         pwm_output.wait_break2_ready();
         let current_feedback = bsp::CurrentFeedback::new(current_mappings);
-        let hall_feedback = bsp::HallFeedback::new(hall_mappings);
+        let mut hall_feedback = bsp::HallFeedback::new(hall_mappings);
         let acceleration = bsp::Acceleration::new(accel_mappings);
+        /*let memory = bsp::Memory::new(memory_mappings);
+
+        if let Some(calibrations) = memory.read_hall_calibrations() {
+            hall_feedback.set_calibration(calibrations);
+        }*/
+
+        let foc_cfg = FocConfig {
+            num_poles: 2,
+            saturation_d_ratio: 0.1
+        };
+        let foc = FOC::new(foc_cfg);
+
+        let estimator = NominalParameters {
+            params: MotorParams {
+                pm_flux_linkage: 0.0
+            }
+        };
 
         (Shared { 
             runtime_config: RuntimeConfig::default(),
             hall_feedback,
+            pwm_output,
             acceleration,
+            // memory,
             debug_mappings,
             button_state: ButtonState::Waiting
         }, 
         Local { 
             current_feedback,
-            calibration_state: CalibrationState::default()
+            calibration_state: CalibrationState::default(),
+            estimator,            
+            foc
         })
     }
 
@@ -141,8 +102,8 @@ mod app {
 
     #[task(
         binds = ADC3, 
-        local = [current_feedback, calibration_state], 
-        shared = [hall_feedback, runtime_config, acceleration], 
+        local = [current_feedback, calibration_state, foc, estimator], 
+        shared = [hall_feedback, pwm_output, runtime_config, acceleration], 
         priority = 3
     )]
     fn on_adc3(mut cx: on_adc3::Context) {
@@ -152,7 +113,7 @@ mod app {
             let mut sector = 0;
             if matches!(application_state, ApplicationState::Calibration | ApplicationState::Running) {
                 // Get the "rotation angle" for park transform as either:
-                // a) the slowly rotating calibration angle (align rotor to desired position)
+                // a) the slowly rotating hall calibration angle (align rotor to desired position)
                 // b) the estimated rotor angle offset by 90 deg (maximize torque in real operation)
                 let rotor_angle_rad = if matches!(application_state, ApplicationState::Calibration) {
                     let pattern = cx.shared.hall_feedback.lock(|hall_feedback| {
@@ -165,16 +126,19 @@ mod app {
                     })
                 };
 
-                let foc_result = cx.shared.acceleration.lock(|acc| {
-                    // Forward clark & park on currents
-                    // iD, iQ
-                    ()
+                let foc_result = cx.shared.acceleration.lock(|accelerator| {
+                    let input = FocInput {
+                        bus_voltage: 0.0, rotor_angle_rad, phase_currents, target_torque: 0.0
+                    };
+                    cx.local.foc.compute(input, accelerator, cx.local.estimator)
                 });
 
-                sector = 0;
+                cx.shared.pwm_output.lock(|pwm| pwm.set_duty_cycles(foc_result.duty_cycles));
+                sector = foc_result.hexagon_sector;
 
                 if matches!(application_state, ApplicationState::Calibration) && cx.local.calibration_state.done() {
-                    cx.shared.hall_feedback.lock(|hall_feedback| hall_feedback.);
+                    // cx.shared.memory.lock(|memory| memory.write_hall_calibrations(cx.local.calibration_state.hall_pattern_to_angle));
+                    cx.shared.hall_feedback.lock(|hall_feedback| hall_feedback.set_calibration(cx.local.calibration_state.hall_pattern_to_angle));
                     cx.shared.runtime_config.lock(|rc| rc.application_state.on_command(UserCommand::FinishCalibration));
                 }
             }
@@ -204,8 +168,8 @@ mod app {
         }
     }*/
 
-    #[idle()]
-    fn idle(cx: idle::Context) -> ! {
+    #[idle(shared=[debug_mappings, acceleration])]
+    fn idle(mut cx: idle::Context) -> ! {
         loop {
             cortex_m::asm::wfi();
         }

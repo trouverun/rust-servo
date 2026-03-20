@@ -1,3 +1,4 @@
+use embassy_stm32::pac::Interrupt;
 use embassy_stm32::comp::*;
 use embassy_stm32::dac::{Ch1};
 use embassy_stm32::peripherals::{
@@ -66,6 +67,7 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
         super::HallFeedbackMappings,   
         super::PwmOutputMappings,
         super::AccelerationMappings,
+        super::MemoryMappings,
         DebugMappings
     ) {
 
@@ -108,6 +110,10 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
     let acceleration = super::AccelerationMappings {
         cordic: p.CORDIC,
     };
+
+    let storage = super::MemoryMappings {
+        flash: p.FLASH,
+    };
     
     // Board specific debug assignments:
     let pot_channel = AdcChannel::degrade_adc(p.PA3);
@@ -135,5 +141,5 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
         btn_timer
     };        
 
-    (current_feedback, hall_feedback, pwm, acceleration, debug)
+    (current_feedback, hall_feedback, pwm, acceleration, storage, debug)
 }

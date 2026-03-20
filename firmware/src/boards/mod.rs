@@ -68,6 +68,6 @@ pub struct AccelerationMappings {
     pub cordic: Peri<'static, CORDIC>,
 }
 
-pub struct StorageMappings {
+pub struct MemoryMappings {
     pub flash: Peri<'static, FLASH>,
 }

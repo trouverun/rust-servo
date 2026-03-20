@@ -19,6 +19,7 @@ rtic-monotonics = { version = "1.0.0", features = ["cortex-m-systick"] }
 embassy-stm32 = { path = "../embassy/embassy-stm32", features = ["stm32g473qe", "defmt", "memory-x", "unstable-pac", "exti", "single-bank"] }
 field-oriented = { path = "../field-oriented" }
 defmt-rtt = "1.1.0"
+num-traits = { version = "0.2", default-features = false }
 
 # cargo build/run
 [profile.dev]
