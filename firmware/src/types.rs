@@ -1,25 +1,24 @@
-use core::f32::consts::PI;
-use crate::{boards::PWM_FREQ};
-
-pub enum UserCommand {
+pub enum Command {
     StartCalibration,
     FinishCalibration,
-    EnableControl,
+    EnableTorqueControl,
+    EnableVelocityControl
 }
 
 #[derive(Clone, Copy)]
-pub enum ApplicationState {
-    Startup, 
+pub enum OperatingMode {
     Idle,
     Calibration,
-    Running,
+    TorqueControl,
+    VelocityControl
 }
 
-impl ApplicationState {
-    pub fn on_command(&self, command: UserCommand) -> Self {
+impl OperatingMode {
+    pub fn on_command(&self, command: Command) -> Self {
         match (self, command) {
-            (ApplicationState::Startup, UserCommand::StartCalibration) => ApplicationState::Calibration,
-            (ApplicationState::Idle, UserCommand::EnableControl) => ApplicationState::Running,
+            (OperatingMode::Idle, Command::StartCalibration) => OperatingMode::Calibration,
+            (OperatingMode::Calibration, Command::FinishCalibration) => OperatingMode::Idle,
+            (OperatingMode::Idle, Command::EnableTorqueControl) => OperatingMode::TorqueControl,
             (_, _) => *self
         }
     }
@@ -44,69 +43,36 @@ impl ButtonState {
     }
 }
 
-pub enum ControlMode {
-    Velocity,
-    Torque
+pub struct BoardStatus {
+    pub dc_bus_voltage: f32,
+    pub temperature: f32,
 }
 
-pub struct RuntimeConfig {
-    pub application_state: ApplicationState,
-    pub control_mode: ControlMode,
+pub struct FirmwareConfig {
+    pub calibration_speed_rad_s: f32,
+    pub calibration_voltage: f32,
+}
+
+impl Default for FirmwareConfig {
+    fn default() -> Self {
+        Self {
+            calibration_speed_rad_s: 25.0,
+            calibration_voltage: 0.0
+        }
+    }
+}
+
+pub struct RuntimeValues {
+    pub rotor_lock_prompt: bool,
     pub target_velocity: f32,
     pub target_torque: f32,
 }
 
-impl Default for RuntimeConfig {
+impl Default for RuntimeValues {
     fn default() -> Self {
         Self {
-            application_state: ApplicationState::Startup,
-            control_mode: ControlMode::Velocity,
+            rotor_lock_prompt: false,
             target_velocity: 0.0, target_torque: 0.0
-        }
-    }
-}
-
-pub struct CalibrationState {
-    target_angle_rad: f32,
-    iteration_counter: u32,
-    settling_time_waited_s: f32,
-    prev_pattern: u8,
-    pub hall_pattern_to_angle: [f32; 4]
-}
-
-impl CalibrationState {
-    pub fn step(&mut self, hall_pattern: u8) -> f32 {
-        let angle = self.target_angle_rad;
-        if self.iteration_counter >= 1000 {
-            const TIME_PASSED: f32 = 1000.0 / PWM_FREQ.0 as f32;
-            if self.settling_time_waited_s >= 1.0 {
-                self.target_angle_rad += 0.62 * TIME_PASSED;
-                if self.prev_pattern != hall_pattern {
-                    self.hall_pattern_to_angle[hall_pattern.clamp(1, 4) as usize] = self.target_angle_rad;
-                }
-            } else {
-                self.settling_time_waited_s += TIME_PASSED;
-                self.prev_pattern = hall_pattern;
-            }
-            self.iteration_counter = 0;
-        } else {
-            self.iteration_counter += 1;
-        }
-        angle
-    }
-    pub fn done(&self) -> bool {
-        self.target_angle_rad > PI
-    }
-}
-
-impl Default for CalibrationState {
-    fn default() -> Self {
-        Self {
-            target_angle_rad: -PI,
-            iteration_counter: 0,
-            settling_time_waited_s: 0.0,
-            prev_pattern: 0,
-            hall_pattern_to_angle: [0.0, 0.0, 0.0, 0.0]
         }
     }
 }

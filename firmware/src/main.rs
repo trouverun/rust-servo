@@ -6,6 +6,7 @@ use servo_firmware as _;
 mod bsp;
 mod boards;
 mod types;
+mod calibration;
 
 pub mod pac {
     pub use embassy_stm32::pac::Interrupt as interrupt;
@@ -14,29 +15,34 @@ pub mod pac {
 
 #[rtic::app(device = crate::pac, peripherals = false, dispatchers = [SPI1, SPI2, SPI3])]
 mod app {
+    use core::{f32::consts::PI, mem};
     use defmt::{info};
     use {defmt_rtt as _};
-    use crate::bsp::{self, Acceleration, CurrentFeedback, HallFeedback, Memory, PwmOutput};
+    use crate::calibration::{CalibrationInputs, CalibrationRunner, HallCalibrator, OfflineMotorEstimator, StageResult};
+    use crate::{bsp::{self, Acceleration, AdcFeedback, HallFeedback, Memory, PwmOutput}, types::{OperatingMode, BoardStatus}};
     use crate::boards::*;
     use crate::types::*;
-    use field_oriented::{DoesFocMath, FOC, FocConfig, FocInput, HasRotorFeedback, MotorParams, NominalParameters};
+    use field_oriented::{ClarkParkValue, FOC, ConstantMotorParameters, FocConfig, FocInput, FocInputType, HasRotorFeedback, MotorParamEstimator, PhaseValues, compute_current_pi_controller_gains};
 
     #[shared]
     struct Shared {
-        runtime_config: RuntimeConfig,
+        mode: OperatingMode,
+        board_status: BoardStatus,
+        config: FirmwareConfig,
+        runtime_values: RuntimeValues,
         hall_feedback: HallFeedback,
         pwm_output: PwmOutput,
         acceleration: Acceleration,
-        //memory: Memory,
+        memory: Memory,
+        motor_parameters: ConstantMotorParameters,
         debug_mappings: DebugMappings,
         button_state: ButtonState,
     }
 
     #[local]
-    struct Local {  
-        current_feedback: CurrentFeedback,
-        calibration_state: CalibrationState,
-        estimator: NominalParameters,
+    struct Local {
+        adc_feedback: AdcFeedback,
+        calibration: CalibrationRunner,
         foc: FOC,
     }
 
@@ -44,7 +50,7 @@ mod app {
     fn init(_cx: init::Context) -> (Shared, Local) {
         let p = bsp::init();
         let (
-            current_mappings, 
+            adc_mappings, 
             hall_mappings, 
             pwm_mappings,
             accel_mappings,
@@ -53,41 +59,55 @@ mod app {
         ) = map_peripherals(p);
         
         let pwm_output = bsp::PwmOutput::new(pwm_mappings);
-        pwm_output.wait_break2_ready();
-        let current_feedback = bsp::CurrentFeedback::new(current_mappings);
+        pwm_output.wait_break2_ready(); // Shows active low for first N cycles, wait it out
+        let adc_feedback = bsp::AdcFeedback::new(adc_mappings);
         let mut hall_feedback = bsp::HallFeedback::new(hall_mappings);
         let acceleration = bsp::Acceleration::new(accel_mappings);
-        /*let memory = bsp::Memory::new(memory_mappings);
+        let memory = bsp::Memory::new(memory_mappings);
 
-        if let Some(calibrations) = memory.read_hall_calibrations() {
-            hall_feedback.set_calibration(calibrations);
-        }*/
+        let config = if let Some(firmware_config) = memory.read_firmware_config() {
+            firmware_config
+        } else {
+            FirmwareConfig::default()
+        };
 
+        let motor_parameters = ConstantMotorParameters::new();
+        let calibration = CalibrationRunner::new(
+            HallCalibrator::new(),
+            OfflineMotorEstimator::new()
+        );
         let foc_cfg = FocConfig {
-            num_poles: 2,
             saturation_d_ratio: 0.1
         };
-        let foc = FOC::new(foc_cfg);
+        let mut foc = FOC::new(foc_cfg);
 
-        let estimator = NominalParameters {
-            params: MotorParams {
-                pm_flux_linkage: 0.0
-            }
-        };
+        // Try to read calibrations and configurations from memory:
+        if let Some(hall_calibrations) = memory.read_hall_calibrations() {
+            hall_feedback.set_calibration(hall_calibrations);
+        }
+        if let Some(motor_parameters) = memory.read_motor_parameters() {
+            motor_estimator.initialize_params(motor_parameters);
+        }
+        if let Some(controller_parameters) = memory.read_controller_parameters() {
+            foc.set_pi_gains(controller_parameters);
+        }
 
-        (Shared { 
-            runtime_config: RuntimeConfig::default(),
+        (Shared {
+            mode: OperatingMode::Idle,
+            board_status: BoardStatus {dc_bus_voltage: 0.0, temperature: 0.0},
+            config,
+            runtime_values: RuntimeValues::default(),
             hall_feedback,
             pwm_output,
             acceleration,
-            // memory,
+            memory,
+            motor_parameters,
             debug_mappings,
-            button_state: ButtonState::Waiting
-        }, 
-        Local { 
-            current_feedback,
-            calibration_state: CalibrationState::default(),
-            estimator,            
+            button_state: ButtonState::Waiting,
+        },
+        Local {
+            adc_feedback,
+            calibration,
             foc
         })
     }
@@ -102,52 +122,86 @@ mod app {
 
     #[task(
         binds = ADC3, 
-        local = [current_feedback, calibration_state, foc, estimator], 
-        shared = [hall_feedback, pwm_output, runtime_config, acceleration], 
+        local = [adc_feedback, calibration, foc],
+        shared = [hall_feedback, pwm_output, acceleration, motor_parameters, mode, board_status, config, runtime_values, memory],
         priority = 3
     )]
-    fn on_adc3(mut cx: on_adc3::Context) {
-        let application_state = cx.shared.runtime_config.lock(|rc| rc.application_state);
-        
-        if let Some(phase_currents) = cx.local.current_feedback.read_currents() {
-            let mut sector = 0;
-            if matches!(application_state, ApplicationState::Calibration | ApplicationState::Running) {
-                // Get the "rotation angle" for park transform as either:
-                // a) the slowly rotating hall calibration angle (align rotor to desired position)
-                // b) the estimated rotor angle offset by 90 deg (maximize torque in real operation)
-                let rotor_angle_rad = if matches!(application_state, ApplicationState::Calibration) {
-                    let pattern = cx.shared.hall_feedback.lock(|hall_feedback| {
-                        hall_feedback.get_pattern()
+    fn currents_adc_isr(mut cx: currents_adc_isr::Context) {
+        let mode = cx.shared.mode.lock(|mode| *mode);
+        let calibrating = matches!(mode, OperatingMode::Calibration);
+        let active = calibrating || matches!(mode, OperatingMode::TorqueControl | OperatingMode::VelocityControl);
+
+        // ADC injected EOC (FOC ISR):
+        let mut voltage_hexagon_sector = 0;
+        if let Some(phase_currents) = cx.local.adc_feedback.read_currents() {
+            if !active {
+                cx.shared.pwm_output.lock(|pwm| {
+                    pwm.set_duty_cycles(PhaseValues { u: 0.0, v: 0.0, w: 0.0 })
+                });
+            } else {
+                let dc_bus_voltage = cx.shared.board_status.lock(|bs| bs.dc_bus_voltage);
+
+                // Determine FOC inputs based on calibration vs torque/velocity control mode:
+                let (rotor_angle_rad, foc_command, calibration_result) = if calibrating {
+                    let (hall_angle, hall_pattern) = cx.shared.hall_feedback.lock(|hf| {
+                        (hf.read().angle, hf.get_pattern())
                     });
-                    cx.local.calibration_state.step(pattern)
+                    let (target_voltage, target_speed) = cx.shared.config.lock(|cfg| {
+                        (cfg.calibration_voltage, cfg.calibration_speed_rad_s)
+                    });
+                    let inputs = CalibrationInputs { hall_angle, hall_pattern, target_voltage, target_speed };
+                    let (output, stage_result) = cx.local.calibration.tick(inputs);
+                    cx.shared.runtime_values.lock(|rtv| rtv.rotor_lock_prompt = output.rotor_lock_prompt);
+                    (output.rotor_angle_rad, output.foc_command, stage_result)
                 } else {
-                    cx.shared.hall_feedback.lock(|hall_feedback| {
-                        hall_feedback.read().angle
-                    })
+                    let rotor_angle_rad = cx.shared.hall_feedback.lock(|hf| hf.read().angle) + 0.5*PI;
+                    let torque = cx.shared.runtime_values.lock(|rtv| rtv.target_torque);
+                    (rotor_angle_rad, FocInputType::TargetTorque(torque), None)
                 };
 
-                let foc_result = cx.shared.acceleration.lock(|accelerator| {
-                    let input = FocInput {
-                        bus_voltage: 0.0, rotor_angle_rad, phase_currents, target_torque: 0.0
-                    };
-                    cx.local.foc.compute(input, accelerator, cx.local.estimator)
+                // FOC computations:
+                let foc_input = FocInput { command, dc_bus_voltage, rotor_angle_rad, phase_currents };
+                let foc_result = cx.shared.motor_parameters.lock(|params| {
+                    cx.shared.acceleration.lock(|acc| {
+                        cx.local.foc.compute(foc_input, acc, params)
+                    })
                 });
-
                 cx.shared.pwm_output.lock(|pwm| pwm.set_duty_cycles(foc_result.duty_cycles));
-                sector = foc_result.hexagon_sector;
+                voltage_hexagon_sector = foc_result.voltage_hexagon_sector;
 
-                if matches!(application_state, ApplicationState::Calibration) && cx.local.calibration_state.done() {
-                    // cx.shared.memory.lock(|memory| memory.write_hall_calibrations(cx.local.calibration_state.hall_pattern_to_angle));
-                    cx.shared.hall_feedback.lock(|hall_feedback| hall_feedback.set_calibration(cx.local.calibration_state.hall_pattern_to_angle));
-                    cx.shared.runtime_config.lock(|rc| rc.application_state.on_command(UserCommand::FinishCalibration));
+                // Apply calibration stage results:
+                match stage_result {
+                    Some(StageResult::HallCalibration { angle_table, pole_count }) => {
+                        cx.shared.hall_feedback.lock(|hf| hf.set_calibration(angle_table));
+                        cx.shared.memory.lock(|m| {
+                            m.write_hall_calibrations(angle_table);
+                        });
+                    }
+                    Some(StageResult::MotorParameters { params, pi_gains }) => {
+                        cx.shared.motor_parameters.lock(|active_params| {
+                            active_params.from_other(&cx.local.calibration.motor_estimator);
+                        });
+                        cx.local.foc.set_pi_gains(pi_gains);
+                        cx.shared.memory.lock(|m| {
+                            m.write_motor_parameters(params);
+                            m.write_controller_parameters(pi_gains);
+                        });
+                        cx.shared.mode.lock(|mode| *mode = mode.on_command(Command::FinishCalibration));
+                    }
+                    None => {}
                 }
             }
-            // Always sample something to keep the loop running
-            cx.local.current_feedback.sample_sector(sector);
+
+            // Always sample something to keep the ADC EOC ISRs running:
+            cx.local.adc_feedback.sample_sector(voltage_hexagon_sector);
         }
         
-        { // If adc3 regular eso
-            // Read VBUS and temperature
+        // ADC regular EOC:
+        if let Some((vbus, tboard)) = cx.local.adc_feedback.read_board_info() {
+            cx.shared.board_status.lock(|bs| {
+                bs.dc_bus_voltage = vbus;
+                bs.temperature = tboard;
+            });
         }
     }/*
 
@@ -192,13 +246,13 @@ mod app {
         }
     }
 
-    #[task(binds = TIM2, shared=[debug_mappings, button_state, runtime_config], priority = 2)]
+    #[task(binds = TIM2, shared=[debug_mappings, button_state, runtime_values, mode], priority = 2)]
     fn on_tim2(mut cx: on_tim2::Context) {
         let press_type = cx.shared.button_state.lock(|bs| *bs);
-        cx.shared.runtime_config.lock(|rc| {
+        cx.shared.mode.lock(|mode| {
             match press_type {
                 ButtonState::LongPress => {
-                    rc.application_state = rc.application_state.on_command(UserCommand::StartCalibration);
+                    *mode = mode.on_command(Command::StartCalibration);
                 }
                 _ => {}
             }
@@ -212,7 +266,7 @@ mod app {
     }
 
     const POT_RECIPROCAL: f32 = 50.0 / ((1 << 12) - 1) as f32;
-    #[task(binds = ADC1_2, shared=[debug_mappings, runtime_config], priority = 1)]
+    #[task(binds = ADC1_2, shared=[debug_mappings, runtime_values], priority = 1)]
     fn on_adc12(mut cx: on_adc12::Context) {
         let adc_reading = cx.shared.debug_mappings.lock(|dm| {
             if dm.pot_adc.check_eoc() {
@@ -223,7 +277,7 @@ mod app {
         });
 
         if let Some(val) = adc_reading {
-            cx.shared.runtime_config.lock(|rc| {
+            cx.shared.runtime_values.lock(|rc| {
                 rc.target_velocity = val;
             });
         }

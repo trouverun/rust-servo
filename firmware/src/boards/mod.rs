@@ -3,11 +3,11 @@ use embassy_stm32::opamp::OpAmpOutput;
 use embassy_stm32::mode::Blocking;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::pwm::{NotRunning, PWM, PwmDeadtime};
-use embassy_stm32::timer::{CountingMode};
+use embassy_stm32::timer::{CountingMode, trigger_output::BasicTrgoOutput};
 #[cfg(feature = "hall-feedback")]
 use embassy_stm32::timer::hall::HallSensor;
 use embassy_stm32::{Peri};
-use embassy_stm32::adc::AnyAdcChannel;  
+use embassy_stm32::adc::{AnyAdcChannel};  
 use embassy_stm32::dac::{Dac, DacChannel};
 use embassy_stm32::comp::Comp;
 use embassy_stm32::peripherals::{CORDIC, FLASH};
@@ -21,9 +21,16 @@ pub use zest1::*;
 pub const PWM_FREQ: Hertz = Hertz(15_000);
 pub const COUNTING_MODE: CountingMode = CountingMode::CenterAlignedBothInterrupts;
 
+pub struct TherimistorLinearScale {
+    pub slope: f32,
+    pub bias: f32
+}
+
 pub struct BoardInfo {
     pub shunt_resistance_mohm: f32,
     pub opamp_gain: f32,
+    pub vbus_divide_factor: f32,
+    pub thermistor_scaling: TherimistorLinearScale
 }
 
 #[cfg(feature = "mcu-opamps")]
@@ -33,14 +40,17 @@ pub struct ShuntOpAmps {
     w: OpAmpOutput<'static, OpAmpW>,
 }
 
-pub struct CurrentFeedbackMappings {
+pub struct AdcFeedbackMappings {
     #[cfg(feature = "mcu-opamps")]
     pub opamps: ShuntOpAmps,
     pub adc_a: Peri<'static, FeedbackAdcA>,
     pub adc_b: Peri<'static, FeedbackAdcB>,
     pub u_channel: AnyAdcChannel<'static, FeedbackAdcA>,
     pub v_channel: AnyAdcChannel<'static, FeedbackAdcA>,
-    pub w_channel: AnyAdcChannel<'static, FeedbackAdcB>
+    pub w_channel: AnyAdcChannel<'static, FeedbackAdcB>,
+    pub vbus_channel: AnyAdcChannel<'static, FeedbackAdcA>,
+    pub tboard_channel: AnyAdcChannel<'static, FeedbackAdcB>,
+    pub sample_trigger: BasicTrgoOutput<'static, AdcFeedbackTimer>,
 }
 
 #[cfg(feature = "hall-feedback")]

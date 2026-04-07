@@ -1,4 +1,3 @@
-use embassy_stm32::pac::Interrupt;
 use embassy_stm32::comp::*;
 use embassy_stm32::dac::{Ch1};
 use embassy_stm32::peripherals::{
@@ -11,7 +10,7 @@ use embassy_stm32::peripherals::{
 };
 use embassy_stm32::opamp::{OpAmp, OpAmpSpeed};
 use embassy_stm32::adc::{
-    Adc345InjectedTrigger, AdcChannel, AdcConfig, AnyAdcChannel, 
+    Adc345InjectedTrigger, Adc345RegularTrigger, AdcChannel, AdcConfig, AnyAdcChannel, 
     ExternalTriggeredADC, NotQueued, Running, SampleTime, Exten,
     Adc, Resolution, Adc12RegularTrigger, JeosInterruptEnabled, EocInterruptEnabled
 };
@@ -26,14 +25,16 @@ use embassy_stm32::{mode::Blocking};
 use embassy_stm32::gpio::{Level, Output, Speed, Pull};
 
 
-// Current feedback:
+// Adc feedback:
 pub type OpAmpU = OPAMP3;
 pub type OpAmpV = OPAMP4;
 pub type OpAmpW = OPAMP5;
 pub type FeedbackAdcA = ADC3;
 pub type FeedbackAdcB = ADC4;
+pub type AdcFeedbackTimer = TIM6;
 pub const FEEDBACK_TRIGGER_A: Adc345InjectedTrigger = Adc345InjectedTrigger::Tim8Trgo2;
 pub const FEEDBACK_TRIGGER_B: Adc345InjectedTrigger = Adc345InjectedTrigger::Tim8Trgo2;
+pub const BOARD_FEEDBACK_TRIGGER: Adc345RegularTrigger = Adc345RegularTrigger::Tim6Trgo;
 
 // Hall feedback:
 pub type HallFeedbackTimer = TIM3;
@@ -49,11 +50,12 @@ pub type PwmTimer = TIM8;
 
 pub const BOARD: super::BoardInfo = super::BoardInfo {
     shunt_resistance_mohm: 15.0,
-    opamp_gain: 15.0
+    opamp_gain: 15.0,
+    vbus_divide_factor: 25.3589743589744,
+    thermistor_scaling: super::TherimistorLinearScale { slope: 45.7, bias: 23.6 }
 };
 
 pub struct DebugMappings {
-    pub basic_trigger: BasicTrgoOutput<'static, TIM6>,
     pub pot_channel: AnyAdcChannel<'static, ADC1>,
     pub pot_adc: ExternalTriggeredADC<'static, ADC1, Running, NotQueued>,
     pub user_btn: ExtiInput<'static, Blocking>,
@@ -63,7 +65,7 @@ pub struct DebugMappings {
 
 pub fn map_peripherals(p: embassy_stm32::Peripherals) -> 
     (
-        super::CurrentFeedbackMappings,
+        super::AdcFeedbackMappings,
         super::HallFeedbackMappings,   
         super::PwmOutputMappings,
         super::AccelerationMappings,
@@ -71,7 +73,7 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
         DebugMappings
     ) {
 
-    let current_feedback = super::CurrentFeedbackMappings {
+    let adc_feedback = super::AdcFeedbackMappings {
         opamps: super::ShuntOpAmps {
             u: OpAmp::new(p.OPAMP3, OpAmpSpeed::HighSpeed).standalone_ext(p.PB0, p.PB2, p.PB1),
             v: OpAmp::new(p.OPAMP4, OpAmpSpeed::HighSpeed).standalone_ext(p.PB11, p.PB10, p.PB12),
@@ -82,6 +84,9 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
         u_channel: AdcChannel::<FeedbackAdcA>::degrade_adc(p.PD11),
         v_channel: AdcChannel::<FeedbackAdcA>::degrade_adc(p.PD12),
         w_channel: AdcChannel::<FeedbackAdcB>::degrade_adc(p.PD14),
+        vbus_channel: AdcChannel::<FeedbackAdcA>::degrade_adc(p.PB13),
+        tboard_channel: AdcChannel::<FeedbackAdcB>::degrade_adc(p.PE15),
+        sample_trigger: BasicTrgoOutput::new(p.TIM6, Hertz(100)),
     };
 
     let hall_feedback = super::HallFeedbackMappings {
@@ -133,7 +138,6 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
     btn_timer.enable_update_interrupt(true);
 
     let debug = DebugMappings {
-        basic_trigger: BasicTrgoOutput::new(p.TIM6, Hertz(100)),
         pot_channel,
         pot_adc,
         user_btn,
@@ -141,5 +145,5 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
         btn_timer
     };        
 
-    (current_feedback, hall_feedback, pwm, acceleration, storage, debug)
+    (adc_feedback, hall_feedback, pwm, acceleration, storage, debug)
 }

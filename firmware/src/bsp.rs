@@ -2,7 +2,7 @@
 use core::f32::consts::{PI, TAU};
 use num_traits::Float;
 
-use embassy_stm32::{flash::{Blocking as BlockingFlash, Flash}, peripherals::CORDIC, timer::{low_level::FilterValue, pwm::{PWM, Running as PwmRunning}}};
+use embassy_stm32::{flash::{Blocking as BlockingFlash, Flash}, peripherals::CORDIC, timer::{low_level::FilterValue, pwm::{PWM, Running as PwmRunning}, trigger_output::BasicTrgoOutput}};
 use embassy_stm32::{Config as RccConfig};
 use embassy_stm32::rcc::*;
 use embassy_stm32::adc::{
@@ -14,16 +14,17 @@ use embassy_stm32::cordic::{Cordic, Precision, NoScale, SqrtScale, Sin, Sqrt, Q1
 use embassy_stm32::pac::timer::{vals::{Bkp}};
 use embassy_stm32::timer::hall::{HallSensor};
 use embassy_stm32::cordic::utils::{f32_to_q1_15, q1_15_to_f32};
-#[cfg(feature = "hall-feedback")]
-use field_oriented::HasRotorFeedback;
-use crate::boards::*;
+use field_oriented::{ControllerParameters, HasRotorFeedback, MotorParams};
+use crate::{boards::*, types::FirmwareConfig};
 use field_oriented::{DoesFocMath, RotorFeedback, SinCosResult, PhaseValues};
 
 const ADC_VOLTAGE: f32 = 3.3;
 const OPAMP_GAIN_RECIPROCAL: f32 = 1.0 / BOARD.opamp_gain;
 const SHUNT_CONDUCTANCE_SIEMENS: f32 = 1000.0 / BOARD.shunt_resistance_mohm;
-const ADC_RESULT_SCALER: f32 = 0.5 / ((1 << 12) - 1) as f32 * ADC_VOLTAGE * OPAMP_GAIN_RECIPROCAL * SHUNT_CONDUCTANCE_SIEMENS;
-
+const ADC_SCALER: f32 = ((1 << 12) - 1) as f32 * ADC_VOLTAGE;
+const CURRENT_READING_SCALER: f32 = 0.5 * ADC_SCALER * OPAMP_GAIN_RECIPROCAL * SHUNT_CONDUCTANCE_SIEMENS;
+const VBUS_READING_SCLAER: f32 = ADC_SCALER * BOARD.vbus_divide_factor;
+const TBOARD_READING_SCLAER: f32 = ADC_SCALER * BOARD.thermistor_scaling.slope;
 
 pub fn init() -> embassy_stm32::Peripherals {
     // Configure sysclk (to 170MHz)
@@ -46,7 +47,10 @@ pub fn init() -> embassy_stm32::Peripherals {
     embassy_stm32::init(rcc_config)
 }
 
-pub struct CurrentFeedback {
+pub type BusVoltage = f32;
+pub type BoardTemperature = f32;
+
+pub struct AdcFeedback {
     #[cfg(feature = "mcu-opamps")]
     _opamps: ShuntOpAmps,
     u_channel: AnyAdcChannel<'static, FeedbackAdcA>,
@@ -54,16 +58,19 @@ pub struct CurrentFeedback {
     w_channel: AnyAdcChannel<'static, FeedbackAdcB>,
     adc_a: ExternalTriggeredADC<'static, FeedbackAdcA, AdcRunning, Queued>,
     adc_b: ExternalTriggeredADC<'static, FeedbackAdcB, AdcRunning, Queued>,
+    sample_trigger: BasicTrgoOutput<'static, AdcFeedbackTimer>,
     sampled_sector: u8,
 }
 
-impl CurrentFeedback {
-    pub fn new(mappings: CurrentFeedbackMappings) -> Self {
-        let CurrentFeedbackMappings { 
+impl AdcFeedback {
+    pub fn new(mappings: AdcFeedbackMappings) -> Self {
+        let AdcFeedbackMappings { 
             #[cfg(feature = "mcu-opamps")]
             opamps,
             adc_a, adc_b, 
             u_channel, v_channel, w_channel,
+            vbus_channel, tboard_channel,
+            sample_trigger
         } = mappings;
         
         let mut adc_a_config: AdcConfig = AdcConfig::default();
@@ -71,7 +78,13 @@ impl CurrentFeedback {
         adc_a_config.resolution = Some(embassy_stm32::adc::Resolution::BITS12);
         let adc_a = Adc::new(adc_a, adc_a_config)
             .to_external_triggered_queued()
+            .with_sequence(
+                &[vbus_channel.get_hw_channel()],
+                BOARD_FEEDBACK_TRIGGER,
+                Exten::RISING_EDGE
+            )
             .using_sampletimes(&[
+                (vbus_channel.get_hw_channel(), SampleTime::CYCLES6_5),
                 (u_channel.get_hw_channel(), SampleTime::CYCLES6_5),
                 (v_channel.get_hw_channel(), SampleTime::CYCLES6_5)])
             .start(EocInterruptEnabled::DISABLED, JeosInterruptEnabled::ENABLED, StartMode::EMPTY);
@@ -80,7 +93,13 @@ impl CurrentFeedback {
         adc_b_config.resolution = Some(embassy_stm32::adc::Resolution::BITS12);
         let adc_b = Adc::new(adc_b, adc_b_config)
             .to_external_triggered_queued()
+            .with_sequence(
+                &[tboard_channel.get_hw_channel()],
+                BOARD_FEEDBACK_TRIGGER,
+                Exten::RISING_EDGE
+            )
             .using_sampletimes(&[
+                (vbus_channel.get_hw_channel(), SampleTime::CYCLES6_5),
                 (v_channel.get_hw_channel(), SampleTime::CYCLES6_5),
                 (w_channel.get_hw_channel(), SampleTime::CYCLES6_5)])
             .start(EocInterruptEnabled::DISABLED, JeosInterruptEnabled::ENABLED, StartMode::EMPTY);
@@ -89,11 +108,19 @@ impl CurrentFeedback {
             _opamps: opamps,
             u_channel, v_channel, w_channel,
             adc_a, adc_b,
-            sampled_sector: 0
-        }.calibrate_adc_offset()
+            sample_trigger,
+            sampled_sector: 0,
+        }.calibrate_opamp_offset()
     }
 
-    fn calibrate_adc_offset(self) -> Self {
+    #[cfg(not(feature = "mcu-opamps"))]
+    fn calibrate_opamp_offset(self) -> Self {
+        self
+    }
+
+    /// Finds the opamp offsets from N samples for each motor phase, and configures the ADC(s) to negate them
+    #[cfg(feature = "mcu-opamps")]
+    fn calibrate_opamp_offset(self) -> Self {
         let mut val_u = 0i32;
         let mut val_va = 0i32;
         let mut val_vb = 0i32;
@@ -132,6 +159,7 @@ impl CurrentFeedback {
             _opamps: self._opamps,
             u_channel: self.u_channel, v_channel: self.v_channel, w_channel: self.w_channel,
             adc_a: tmp_a, adc_b: tmp_b,
+            sample_trigger: self.sample_trigger,
             sampled_sector: self.sampled_sector
         }
     }
@@ -142,8 +170,8 @@ impl CurrentFeedback {
             let result_a= self.adc_a.read_injected::<1>()[0];
             // V or W:
             let result_b= self.adc_b.read_injected::<1>()[0];
-            let amps_a = result_a as f32 * ADC_RESULT_SCALER;
-            let amps_b = result_b as f32 * ADC_RESULT_SCALER;
+            let amps_a = result_a as f32 * CURRENT_READING_SCALER;
+            let amps_b = result_b as f32 * CURRENT_READING_SCALER;
             let amps_c = -(amps_a + amps_b);
             match self.sampled_sector {
                 // 1 0 0, sampled VW:
@@ -185,12 +213,22 @@ impl CurrentFeedback {
         self.adc_b.insert_injected_context(&[source_b], Adc345InjectedTrigger::Tim8Trgo2, Exten::RISING_EDGE);
         self.sampled_sector = sector;
     }
+
+    pub fn read_board_info(&self) -> Option<(BusVoltage, BoardTemperature)> {
+        if self.adc_a.check_eoc() {
+            let vbus = self.adc_a.read() as f32 * VBUS_READING_SCLAER;
+            let tboard = self.adc_b.read() as f32 * TBOARD_READING_SCLAER + BOARD.thermistor_scaling.bias;
+            return Some((vbus, tboard))
+        } else {
+            return None
+        }
+    }
 }
 
 #[cfg(feature = "hall-feedback")]
 pub struct HallFeedback {
     pub sensor: HallSensor<'static, HallFeedbackTimer>,
-    hall_pattern_to_angle: [f32; 4],
+    hall_pattern_to_angle: [f32; 6],
 }
 
 #[cfg(feature = "hall-feedback")]
@@ -198,7 +236,7 @@ impl HallFeedback {
     pub fn new(mappings: HallFeedbackMappings) -> Self {
         Self {
             sensor: mappings.sensor,
-            hall_pattern_to_angle: [0.0, 0.0, 0.0, 0.0]
+            hall_pattern_to_angle: [0.0; 6]
         }
     }
 
@@ -206,7 +244,7 @@ impl HallFeedback {
         self.sensor.read_hall_pattern()
     }
 
-    pub fn set_calibration(&mut self, calibrations: [f32; 4]) {
+    pub fn set_calibration(&mut self, calibrations: [f32; 6]) {
         self.hall_pattern_to_angle = calibrations;
     }
 
@@ -300,8 +338,7 @@ impl DoesFocMath for Acceleration {
     }
 
     fn sqrt(&mut self, val: f32) -> f32 {
-        // Pre-scale by 4^k to bring val into CORDIC range [0.027, 2.34].
-        // sqrt(x) = sqrt(x / 4^k) · 2^k
+        // Pre-scale by 4^k to bring val into CORDIC range [0.027, 2.34]
         let mut x = val;
         let mut k: u32 = 0;
         while x >= 2.341 {
@@ -309,8 +346,7 @@ impl DoesFocMath for Acceleration {
             k += 1;
         }
 
-        // Pick hardware scale n whose valid x range contains our value (RM Table 117).
-        // ARG1 = x · 2^(-n), RES1 = sqrt(x) · 2^(-n), final = RES1 · 2^(n+k)
+        // Pick hardware scale n whose valid x range contains pre-scaled value
         let (scale, n, arg_mul) = if x < 0.75 {
             (SqrtScale::N0, 0u32, 1.0)
         } else if x < 1.75 {
@@ -322,6 +358,8 @@ impl DoesFocMath for Acceleration {
 
         let mut cfg = self.cordic.configure::<Sqrt, Q15>(Precision::Iters12, scale);
         let raw = cfg.start1(x_q15).result();
+
+        // Unscale and convert to float:
         q1_15_to_f32(raw) * (1 << (n + k)) as f32
     }
 }
@@ -338,11 +376,36 @@ impl Memory {
         }
     }
 
-    pub fn read_hall_calibrations(&self) -> Option<[f32; 4]> {
+    pub fn read_firmware_config(&self) -> Option<FirmwareConfig> {
         None
     }
 
-    pub fn write_hall_calibrations(&self, calibrations: [f32; 4]) {
+    pub fn write_firmware_config(&self, config: FirmwareConfig) {
 
     }
+
+    pub fn read_hall_calibrations(&self) -> Option<[f32; 6]> {
+        None
+    }
+
+    pub fn write_hall_calibrations(&self, calibrations: [f32; 6]) {
+
+    }
+
+    pub fn read_motor_parameters(&self) -> Option<MotorParams> {
+        None
+    }
+
+    pub fn write_motor_parameters(&self, params: MotorParams) {
+
+    }
+
+    pub fn read_controller_parameters(&self) -> Option<ControllerParameters> {
+        None
+    }
+
+    pub fn write_controller_parameters(&self, params: ControllerParameters) {
+
+    }
+    
 }
