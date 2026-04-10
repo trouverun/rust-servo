@@ -58,7 +58,7 @@ impl FOC {
         let sc_e = accelerator.sin_cos(theta_e);
         let measured_i_dq = forward_clark_park(input.phase_currents, sc_e);
 
-        let u_dq = match input.command {
+        let (u_dq, target_i_dq) = match input.command {
             FocInputType::TargetTorque(target_torque) => {
                 // Derive target q,d-axis currents:
                 let k_tau = if motor_params.num_pole_pairs != 0 && motor_params.pm_flux_linkage != 0.0 {
@@ -68,15 +68,16 @@ impl FOC {
                 };
                 let target_i_d = 0.0;
                 let target_i_q = k_tau * target_torque;
+                let target_i_dq = ClarkParkValue { d: target_i_d, q: target_i_q };
                 // q,d-axis current PI controllers:
                 let u_d = self.d_pi.compute(target_i_d, measured_i_dq.d, self.u_dq_saturation.d);
                 let u_q = self.q_pi.compute(target_i_q, measured_i_dq.q, self.u_dq_saturation.q);
                 // Cross-coupling compensation feedforward:
-                let d_ff = motor_params.q_inductance*measured_i_dq.q*omega_e;
-                let q_ff = -omega_e*(motor_params.pm_flux_linkage + motor_params.d_inductance*measured_i_dq.d);
-                ClarkParkValue { d: u_d + d_ff, q: u_q + q_ff }
+                let d_ff = -motor_params.q_inductance*measured_i_dq.q*omega_e;
+                let q_ff = omega_e*(motor_params.pm_flux_linkage + motor_params.d_inductance*measured_i_dq.d);
+                (ClarkParkValue { d: u_d + d_ff, q: u_q + q_ff }, target_i_dq)
             }
-            FocInputType::RawVoltage(u) => u
+            FocInputType::RawVoltage(u) => (u, measured_i_dq)
         };
 
         // When outside of the linear modulation region clamp in a way which 
@@ -121,7 +122,10 @@ impl FOC {
 
         FocResult {
             duty_cycles,
-            voltage_hexagon_sector
+            voltage_hexagon_sector,
+            measured_i_dq,
+            target_i_dq,
+            u_dq,
         }
     }
 
@@ -174,6 +178,9 @@ mod tests {
             assert!(false, "Couldn't tune controller")
         }
 
+        let motor_params = estimator.get_params();
+        let iq_setpoint = 0.666667 / (motor_params.num_pole_pairs as f32 * motor_params.pm_flux_linkage) * setpoint;
+
         let mut state = sim.state();
         let mut time_s = 0.0_f32;
         let mut records = std::vec::Vec::new();
@@ -196,10 +203,13 @@ mod tests {
 
             if time_s < 0.001 {
                 // Overshoot <= 5%
-                assert!(state.torque <= 1.05*setpoint, "Step response overshoot threshold exceeded")
+                assert!(state.i_q <= 1.05*iq_setpoint, "Step response overshoot threshold exceeded")
             } else {
                 // Settling time (to within 2%) <= 1ms
-                assert!(state.torque <= 1.02*setpoint, "Step response settling time exceeded")
+                assert!(
+                    0.98*iq_setpoint <= state.i_q && state.i_q <= 1.02*iq_setpoint,
+                    "Step response settling time exceeded"
+                )
             }
 
             time_s += sim_dt;

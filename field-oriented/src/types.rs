@@ -59,5 +59,8 @@ pub struct FocInput {
 #[derive(Clone, Copy)]
 pub struct FocResult {
     pub duty_cycles: PhaseValues,
-    pub voltage_hexagon_sector: u8
+    pub voltage_hexagon_sector: u8,
+    pub measured_i_dq: ClarkParkValue,
+    pub target_i_dq: ClarkParkValue,
+    pub u_dq: ClarkParkValue,
 }

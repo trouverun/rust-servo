@@ -11,7 +11,11 @@ pub struct SimOutput {
     /// Phase winding currents in UVW coordinates
     pub currents: crate::PhaseValues,
     /// Produced rotor torque in Nm
-    pub torque: f32
+    pub torque: f32,
+    /// Direct axis current
+    pub i_d: f32,
+    /// Quadrature axis current
+    pub i_q: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -100,7 +104,9 @@ impl PMSMSim {
             theta,
             omega,
             currents: crate::inverse_clark_park(tmp, sc),
-            torque
+            torque,
+            i_d,
+            i_q,
         }
     }
 
@@ -115,7 +121,9 @@ impl PMSMSim {
             currents: crate::inverse_clark_park(
                 crate::ClarkParkValue { d: i_d, q: i_q }, sc
             ),
-            torque: 0.0
+            torque: 0.0,
+            i_d,
+            i_q,
         }
     }
 }

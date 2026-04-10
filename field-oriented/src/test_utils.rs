@@ -54,9 +54,6 @@ pub fn plot_simulation(path: &str, dt: f32, records: &[SimRecord]) {
     // Collect series
     let theta: Vec<f32> = records.iter().map(|r| r.sim.theta).collect();
     let omega: Vec<f32> = records.iter().map(|r| r.sim.omega).collect();
-    let i_u: Vec<f32> = records.iter().map(|r| r.sim.currents.u).collect();
-    let i_v: Vec<f32> = records.iter().map(|r| r.sim.currents.v).collect();
-    let i_w: Vec<f32> = records.iter().map(|r| r.sim.currents.w).collect();
     let d_u: Vec<f32> = records.iter().map(|r| r.result.duty_cycles.u).collect();
     let d_v: Vec<f32> = records.iter().map(|r| r.result.duty_cycles.v).collect();
     let d_w: Vec<f32> = records.iter().map(|r| r.result.duty_cycles.w).collect();
@@ -76,17 +73,28 @@ pub fn plot_simulation(path: &str, dt: f32, records: &[SimRecord]) {
     // 2. Rotor speed
     plot.add_trace(line_trace(&time, &omega, "ω", row));
     row += 1;
-    // 3. Phase currents
-    plot.add_trace(line_trace(&time, &i_u, "I_u", row));
-    plot.add_trace(line_trace(&time, &i_v, "I_v", row));
-    plot.add_trace(line_trace(&time, &i_w, "I_w", row));
-    row += 1;
-    // 4. Duty cycles
+    // 3. Duty cycles
     plot.add_trace(line_trace(&time, &d_u, "D_u", row));
     plot.add_trace(line_trace(&time, &d_v, "D_v", row));
     plot.add_trace(line_trace(&time, &d_w, "D_w", row));
     row += 1;
-    // 5. Torque
+    // 4. D/Q voltages
+    let u_d: Vec<f32> = records.iter().map(|r| r.result.u_dq.d).collect();
+    let u_q: Vec<f32> = records.iter().map(|r| r.result.u_dq.q).collect();
+    plot.add_trace(line_trace(&time, &u_d, "U_d", row));
+    plot.add_trace(line_trace(&time, &u_q, "U_q", row));
+    row += 1;
+    // 5. D/Q axis currents
+    let meas_id: Vec<f32> = records.iter().map(|r| r.result.measured_i_dq.d).collect();
+    let meas_iq: Vec<f32> = records.iter().map(|r| r.result.measured_i_dq.q).collect();
+    let tgt_id: Vec<f32> = records.iter().map(|r| r.result.target_i_dq.d).collect();
+    let tgt_iq: Vec<f32> = records.iter().map(|r| r.result.target_i_dq.q).collect();
+    plot.add_trace(line_trace(&time, &meas_id, "I_d", row));
+    plot.add_trace(line_trace(&time, &meas_iq, "I_q", row));
+    plot.add_trace(line_trace(&time, &tgt_id, "I_d target", row));
+    plot.add_trace(line_trace(&time, &tgt_iq, "I_q target", row));
+    row += 1;
+    // 6. Torque
     let torque: Vec<f32> = records.iter().map(|r| r.sim.torque).collect();
     plot.add_trace(line_trace(&time, &torque, "torque", row));
     if has_torque_target {
@@ -119,11 +127,13 @@ pub fn plot_simulation(path: &str, dt: f32, records: &[SimRecord]) {
         .x_axis3(xa(3, "y3"))
         .x_axis4(xa(4, "y4"))
         .x_axis5(xa(5, "y5"))
+        .x_axis6(xa(6, "y6"))
         .y_axis(ya(1, "Rotor Angle [rad]", "x"))
         .y_axis2(ya(2, "Rotor Speed [rad/s]", "x2"))
-        .y_axis3(ya(3, "Phase Currents [A]", "x3"))
-        .y_axis4(ya(4, "Duty Cycles", "x4"))
-        .y_axis5(ya(5, "Torque [Nm]", "x5"));
+        .y_axis3(ya(3, "Duty Cycles", "x3"))
+        .y_axis4(ya(4, "D/Q Voltages [V]", "x4"))
+        .y_axis5(ya(5, "D/Q Currents [A]", "x5"))
+        .y_axis6(ya(6, "Torque [Nm]", "x6"));
 
     plot.set_layout(layout);
     plot.write_html(path);
