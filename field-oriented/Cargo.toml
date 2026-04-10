@@ -6,3 +6,6 @@ edition = "2024"
 [dependencies]
 num-complex = { version = "0.4", default-features = false, features = ["libm"] }
 libm = { version = "0.2", default-features = false }
+
+[dev-dependencies]
+plotly = "0.10"

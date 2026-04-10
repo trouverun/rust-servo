@@ -1,26 +1,22 @@
 use super::types::*;
 
-/// = 0.5
-const A: f32 = 0.5;
 /// = sqrt(3)/2
-const B: f32 = 0.86602540378; 
-/// = 2/3
-const C: f32 = 0.66666666666;
+const SQRT3_2: f32 = 0.86602540378; 
 
-pub(crate) fn forward_clark_park(vals: PhaseValues, sc: SinCosResult) -> ClarkParkResult {
-    let d = C * (sc.cos * vals.u + (-A*sc.cos + B*sc.sin) * vals.v + (-A*sc.cos - B*sc.sin) * vals.w);
-    let q = C * (-sc.sin * vals.u + (A*sc.sin + B*sc.cos) * vals.v + (A*sc.sin - B*sc.cos) * vals.w);
-    ClarkParkResult { d, q }
+pub(crate) fn forward_clark_park(vals: PhaseValues, sc: SinCosResult) -> ClarkParkValue {
+    let d = 0.666667 * (sc.cos * vals.u + (-0.5*sc.cos + SQRT3_2*sc.sin) * vals.v + (-0.5*sc.cos - SQRT3_2*sc.sin) * vals.w);
+    let q = 0.666667 * (-sc.sin * vals.u + (0.5*sc.sin + SQRT3_2*sc.cos) * vals.v + (0.5*sc.sin - SQRT3_2*sc.cos) * vals.w);
+    ClarkParkValue { d, q }
 }
 
-pub(crate) fn inverse_clark_park(vals: ClarkParkResult, sc: SinCosResult) -> PhaseValues {
+pub(crate) fn inverse_clark_park(vals: ClarkParkValue, sc: SinCosResult) -> PhaseValues {
     let u = sc.cos * vals.d - sc.sin * vals.q;
-    let v = (-A*sc.cos + B*sc.sin) * vals.d + (A*sc.sin + B*sc.cos) * vals.q;
-    let w = (-A*sc.cos - B*sc.sin) * vals.d + (A*sc.sin - B*sc.cos) * vals.q;
+    let v = (-0.5*sc.cos + SQRT3_2*sc.sin) * vals.d + (0.5*sc.sin + SQRT3_2*sc.cos) * vals.q;
+    let w = (-0.5*sc.cos - SQRT3_2*sc.sin) * vals.d + (0.5*sc.sin - SQRT3_2*sc.cos) * vals.q;
     PhaseValues { u, v, w }
 }
 
-pub(crate) fn inverse_park(vals: ClarkParkResult, sc: SinCosResult) -> AlphaBeta {
+pub(crate) fn inverse_park(vals: ClarkParkValue, sc: SinCosResult) -> AlphaBeta {
     AlphaBeta {
         alpha: sc.cos * vals.d - sc.sin * vals.q,
         beta:  sc.sin * vals.d + sc.cos * vals.q,
@@ -30,17 +26,18 @@ pub(crate) fn inverse_park(vals: ClarkParkResult, sc: SinCosResult) -> AlphaBeta
 pub(crate) fn inverse_clarke(ab: AlphaBeta) -> PhaseValues {
     PhaseValues {
         u: ab.alpha,
-        v: -A * ab.alpha + B * ab.beta,
-        w: -A * ab.alpha - B * ab.beta,
+        v: -0.5 * ab.alpha + SQRT3_2 * ab.beta,
+        w: -0.5 * ab.alpha - SQRT3_2 * ab.beta,
     }
 }
 
-const SQRT3: f32 = 1.73205080757;
 pub(crate) fn voltage_sector(ab: &AlphaBeta) -> u8 {
-    let a = ab.beta > 0.0;
-    let b = ab.beta >  SQRT3 * ab.alpha;
-    let c = ab.beta > -SQRT3 * ab.alpha;
-    match (a as u8) | ((b as u8) << 1) | ((c as u8) << 2) {
+    /// sqrt(3)
+    const SQRT3: f32 = 1.73205080757;
+    let compare1 = ab.beta > 0.0;
+    let compare2 = ab.beta >  SQRT3 * ab.alpha;
+    let compare3: bool = ab.beta > -SQRT3 * ab.alpha;
+    match (compare1 as u8) | ((compare2 as u8) << 1) | ((compare3 as u8) << 2) {
         0b101 => 0,
         0b111 => 1,
         0b011 => 2,
