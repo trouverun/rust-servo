@@ -2,6 +2,7 @@ use core::f32::consts::TAU;
 use libm::{cosf as cosf32, sinf as sinf32};
 use crate::ClarkParkValue;
 
+#[derive(Clone, Copy)]
 pub struct SimOutput {
     /// Rotor angle in radians
     pub theta: f32,
@@ -40,10 +41,10 @@ impl Default for PMSMConfig {
         PMSMConfig {
             dc_bus_voltage: 24.0,
             num_pole_pairs: 2.0,
-            stator_resistance: 0.5, 
-            inductance: 0.001, 
-            pm_flux_linkage: 0.01,
-            rotor_inertia: 0.00005, 
+            stator_resistance: 0.66, 
+            inductance: 0.00184, 
+            pm_flux_linkage: 0.0167,
+            rotor_inertia: 6.7e-6, 
         }
     }
 }
@@ -84,7 +85,7 @@ impl PMSMSim {
         //   di_d/dt = v_d/L - R*i_d/L + omega_e*i_q
         //   di_q/dt = v_q/L - R*i_q/L - omega_e*i_d - omega_e*pm_flux_linkage/L
         let di_d = (v.d - cfg.stator_resistance * i_d + cfg.inductance * omega_e * i_q) / cfg.inductance;
-        let di_q = (v.q - cfg.stator_resistance * i_q - cfg.inductance * omega_e * i_d + omega_e * cfg.pm_flux_linkage) / cfg.inductance;
+        let di_q = (v.q - cfg.stator_resistance * i_q - cfg.inductance * omega_e * i_d - omega_e * cfg.pm_flux_linkage) / cfg.inductance;
         let i_d = i_d + self.dt * di_d;
         let i_q = i_q + self.dt * di_q;
 

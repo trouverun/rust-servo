@@ -36,8 +36,9 @@ pub struct FOC {
 impl FOC {
     pub fn new(config: FocConfig, pwm_freq_hz: f32) -> Self {
         let zero_gains = PIGains { kr: 0.0, kp: 0.0, ki: 0.0, kt: 0.0 };
-        let d_pi = PIController::new(zero_gains, pwm_freq_hz);
-        let q_pi = PIController::new(zero_gains, pwm_freq_hz);
+        let sampling_time_s = 1.0 / pwm_freq_hz;
+        let d_pi = PIController::new(zero_gains, sampling_time_s);
+        let q_pi = PIController::new(zero_gains, sampling_time_s);
 
         Self {
             config,
@@ -139,25 +140,25 @@ impl FOC {
 
 // ---------------------------------------------------------------------------------------------------------------------
 
-
 #[cfg(test)]
 mod tests {
-    use libm::sinf;
     use super::*;
 
     #[test]
-    fn pmsm_known_params_velocity_tracking() {
-        let dt = 1e-5;
+    fn pmsm_known_params_step_response() {
+        let setpoint = 0.12;
+        let pwm_freq_hz = 20_000.0;
+        let sim_dt = 1.0/pwm_freq_hz;
         let sim_cfg = PMSMConfig::default();
-        let sim = PMSMSim::new(dt, sim_cfg);
+        let mut sim = PMSMSim::new(sim_dt, sim_cfg);
 
         let foc_cfg = FocConfig {
             saturation_d_ratio: 0.0
         };
-        let foc = FOC::new(foc_cfg, 20_000.0);
+        let mut foc = FOC::new(foc_cfg, pwm_freq_hz);
 
-        let accelerator = DummyAccelerator;
-        let estimator = ConstantMotorParameters {
+        let mut accelerator = DummyAccelerator;
+        let mut estimator = ConstantMotorParameters {
             params: MotorParams { 
                 num_pole_pairs: sim_cfg.num_pole_pairs as u8,
                 stator_resistance: sim_cfg.stator_resistance, 
@@ -167,14 +168,43 @@ mod tests {
             }
         };
 
-        /*
+        if let Some(gains) = compute_current_pi_controller_gains::<50>(estimator.get_params(), pwm_freq_hz) {
+            foc.set_pi_gains(gains);
+        } else {
+            assert!(false, "Couldn't tune controller")
+        }
+
+        let mut state = sim.state();
         let mut time_s = 0.0_f32;
-        while time_s < 2.5 {
+        let mut records = std::vec::Vec::new();
+        while time_s < 0.005 {
             let foc_input = FocInput {
-                command: FocInputType::TargetTorque()
+                command: FocInputType::TargetTorque(setpoint),
+                dc_bus_voltage: sim_cfg.dc_bus_voltage,
+                rotor_angle_rad: state.theta,
+                rotor_angular_velocity_rad_s: state.omega,
+                phase_currents: state.currents
+            };
+            let foc_result = foc.compute(foc_input, &mut accelerator, &mut estimator);
+
+            state = sim.step(foc_result);
+            records.push(SimRecord {
+                input: foc_input,
+                result: foc_result,
+                sim: state,
+            });
+
+            if time_s < 0.001 {
+                // Overshoot <= 5%
+                assert!(state.torque <= 1.05*setpoint, "Step response overshoot threshold exceeded")
+            } else {
+                // Settling time (to within 2%) <= 1ms
+                assert!(state.torque <= 1.02*setpoint, "Step response settling time exceeded")
             }
 
-            time_s += dt;
-        }*/
+            time_s += sim_dt;
+        }
+
+        plot_simulation("pmsm_step_response.html", sim_dt as f32, &records);
     }
 }

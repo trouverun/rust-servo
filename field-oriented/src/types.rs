@@ -29,6 +29,7 @@ pub struct ClarkParkValue {
     pub q: f32
 }
 
+#[derive(Clone, Copy)]
 pub struct PhaseValues {
     pub u: f32,
     pub v: f32,
@@ -40,11 +41,13 @@ pub struct FocConfig {
 }
 
 type TorqueNm = f32;
+#[derive(Clone, Copy)]
 pub enum FocInputType {
     RawVoltage(ClarkParkValue),
     TargetTorque(TorqueNm)
 }
 
+#[derive(Clone, Copy)]
 pub struct FocInput {
     pub command: FocInputType,
     pub dc_bus_voltage: f32,
@@ -53,6 +56,7 @@ pub struct FocInput {
     pub phase_currents: PhaseValues,
 }
 
+#[derive(Clone, Copy)]
 pub struct FocResult {
     pub duty_cycles: PhaseValues,
     pub voltage_hexagon_sector: u8
