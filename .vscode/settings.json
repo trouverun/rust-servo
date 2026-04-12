@@ -2,5 +2,9 @@
     "rust-analyzer.linkedProjects": [
         "firmware/Cargo.toml",
         "field-oriented/Cargo.toml"
-    ]
+    ],
+    "rust-analyzer.check.allTargets": false,
+    "rust-analyzer.cargo.cfgs": {
+        "test": null
+    }
 }

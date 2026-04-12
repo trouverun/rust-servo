@@ -1,6 +1,6 @@
 pub struct RotorFeedback {
     pub angle: f32,
-    pub speed: f32
+    pub velocity: f32
 }
 
 pub trait HasRotorFeedback {
@@ -43,14 +43,22 @@ pub struct FocConfig {
 type TorqueNm = f32;
 #[derive(Clone, Copy)]
 pub enum FocInputType {
-    RawVoltage(ClarkParkValue),
-    TargetTorque(TorqueNm)
+    TargetCurrents(ClarkParkValue),
+    TargetTorque(TorqueNm),
+    TargetVoltage(ClarkParkValue)
+}
+
+#[derive(Clone, Copy)]
+pub enum AngleType {
+    Mechanical,
+    Electrical,
 }
 
 #[derive(Clone, Copy)]
 pub struct FocInput {
     pub command: FocInputType,
     pub dc_bus_voltage: f32,
+    pub angle_type: AngleType,
     pub rotor_angle_rad: f32,
     pub rotor_angular_velocity_rad_s: f32,
     pub phase_currents: PhaseValues,
@@ -63,4 +71,25 @@ pub struct FocResult {
     pub measured_i_dq: ClarkParkValue,
     pub target_i_dq: ClarkParkValue,
     pub u_dq: ClarkParkValue,
+}
+
+#[derive(Clone, Copy)]
+pub struct MotorParams {
+    pub num_pole_pairs: u8,
+    pub stator_resistance: f32,
+    pub d_inductance: f32,
+    pub q_inductance: f32,
+    pub pm_flux_linkage: f32,
+}
+
+pub struct FocIterationData {
+    pub measured_i_dq: ClarkParkValue,
+    pub u_dq: ClarkParkValue,
+    pub omega_e: f32,
+}
+
+pub trait MotorParamEstimator {
+    fn after_foc_iteration(&mut self, data: FocIterationData);
+    fn get_params(&self) -> MotorParams;
+    fn parameters_valid(&self) -> bool;
 }

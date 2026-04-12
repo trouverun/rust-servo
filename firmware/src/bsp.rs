@@ -259,7 +259,7 @@ impl HasRotorFeedback for HallFeedback {
         let raw_state = self.sensor.read_state();
         RotorFeedback {
             angle: 0.0,
-            speed: 0.0
+            velocity: 0.0
         }
     }
 }

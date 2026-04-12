@@ -15,12 +15,14 @@ mod test_utils;
 pub use crate::types::*;
 use crate::{math::*, pi_control::PIGains};
 pub use crate::pi_control::{PIController, compute_current_pi_controller_gains};
-pub use crate::estimation::*;
+pub use crate::estimation::{HallCalibrator, OfflineMotorEstimator, OfflineEstimatorCommand, OfflineEstimatorOutput, OfflineEstimatorConfig};
 #[cfg(test)]
 pub use crate::sim::*;
 #[cfg(test)]
 pub use crate::test_utils::*;
 
+
+#[derive(Clone, Copy)]
 pub struct ControllerParameters {
     pub d_pi: PIGains,
     pub q_pi: PIGains
@@ -28,6 +30,8 @@ pub struct ControllerParameters {
 
 pub struct FOC {
     config: FocConfig,
+    calibration_d_pi: PIController,
+    calibration_q_pi: PIController,
     d_pi: PIController,
     q_pi: PIController,
     u_dq_saturation: ClarkParkValue
@@ -35,13 +39,21 @@ pub struct FOC {
 
 impl FOC {
     pub fn new(config: FocConfig, pwm_freq_hz: f32) -> Self {
-        let zero_gains = PIGains { kr: 0.0, kp: 0.0, ki: 0.0, kt: 0.0 };
         let sampling_time_s = 1.0 / pwm_freq_hz;
+
+        // Slow I controller for calibration steady-state use:
+        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 1e3, kt: 0.0 };
+        let calibration_d_pi = PIController::new(calibration_gains, sampling_time_s);
+        let calibration_q_pi = PIController::new(calibration_gains, sampling_time_s);
+
+        // Normal use:
+        let zero_gains = PIGains { kr: 0.0, kp: 0.0, ki: 0.0, kt: 0.0 };
         let d_pi = PIController::new(zero_gains, sampling_time_s);
         let q_pi = PIController::new(zero_gains, sampling_time_s);
 
         Self {
             config,
+            calibration_d_pi, calibration_q_pi,
             d_pi, q_pi,
             u_dq_saturation: ClarkParkValue { d: 0.0, q: 0.0 }
         }
@@ -53,31 +65,43 @@ impl FOC {
         estimator: &mut E
     ) -> FocResult where A: DoesFocMath, E: MotorParamEstimator {
         let motor_params = estimator.get_params();
-        let theta_e = motor_params.num_pole_pairs as f32 * input.rotor_angle_rad;
-        let omega_e = motor_params.num_pole_pairs as f32 * input.rotor_angular_velocity_rad_s;
+        let pp = match input.angle_type {
+            AngleType::Electrical => 1.0,
+            AngleType::Mechanical => motor_params.num_pole_pairs as f32,
+        };
+        let theta_e = pp * input.rotor_angle_rad;
+        let omega_e = pp * input.rotor_angular_velocity_rad_s;
         let sc_e = accelerator.sin_cos(theta_e);
         let measured_i_dq = forward_clark_park(input.phase_currents, sc_e);
 
+
         let (u_dq, target_i_dq) = match input.command {
+            FocInputType::TargetVoltage(voltage) => {
+                (voltage, ClarkParkValue { d: 0.0, q: 0.0 })
+            }
             FocInputType::TargetTorque(target_torque) => {
-                // Derive target q,d-axis currents:
+                // Derive target q,d-axis currents from torque command:
                 let k_tau = if motor_params.num_pole_pairs != 0 && motor_params.pm_flux_linkage != 0.0 {
                     0.666667 / (motor_params.num_pole_pairs as f32 * motor_params.pm_flux_linkage)
                 } else {
                     0.0
                 };
-                let target_i_d = 0.0;
-                let target_i_q = k_tau * target_torque;
-                let target_i_dq = ClarkParkValue { d: target_i_d, q: target_i_q };
-                // q,d-axis current PI controllers:
-                let u_d = self.d_pi.compute(target_i_d, measured_i_dq.d, self.u_dq_saturation.d);
-                let u_q = self.q_pi.compute(target_i_q, measured_i_dq.q, self.u_dq_saturation.q);
+                
+                let target_i_dq = ClarkParkValue { d: 0.0, q: k_tau * target_torque };
+                let mut u_d = self.d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
+                let mut u_q = self.q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
+
                 // Cross-coupling compensation feedforward:
-                let d_ff = -motor_params.q_inductance*measured_i_dq.q*omega_e;
-                let q_ff = omega_e*(motor_params.pm_flux_linkage + motor_params.d_inductance*measured_i_dq.d);
-                (ClarkParkValue { d: u_d + d_ff, q: u_q + q_ff }, target_i_dq)
+                u_d += -motor_params.q_inductance*measured_i_dq.q*omega_e;
+                u_q += omega_e*(motor_params.pm_flux_linkage + motor_params.d_inductance*measured_i_dq.d);
+
+                (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
             }
-            FocInputType::RawVoltage(u) => (u, measured_i_dq)
+            FocInputType::TargetCurrents(target_i_dq) => {
+                let u_d = self.calibration_d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
+                let u_q = self.calibration_q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
+                (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
+            }
         };
 
         // When outside of the linear modulation region clamp in a way which 
@@ -85,14 +109,19 @@ impl FOC {
         // (which can then be used for field weakening)
         const SQRT3_RECIPROCAL: f32 = 1.0/1.73205080757;
         let u_max = input.dc_bus_voltage * SQRT3_RECIPROCAL;
-        let u_d_limit = self.config.saturation_d_ratio * u_max;
-        let u_q_limit = u_max * accelerator.sqrt(1.0 - self.config.saturation_d_ratio*self.config.saturation_d_ratio);
-        let u_d_sat = u_dq.d.clamp(-u_d_limit, u_d_limit);
-        let u_q_sat = u_dq.q.clamp(-u_q_limit, u_q_limit);
+        let u_mag_sq = u_dq.d*u_dq.d + u_dq.q*u_dq.q;
+        let (u_d_sat, u_q_sat) = if u_mag_sq > u_max*u_max {
+            let u_d_limit = self.config.saturation_d_ratio * u_max;
+            let u_d_clamped = u_dq.d.clamp(-u_d_limit, u_d_limit);
+            let u_q_limit = accelerator.sqrt(u_max*u_max - u_d_clamped*u_d_clamped);
+            (u_d_clamped, u_dq.q.clamp(-u_q_limit, u_q_limit))
+        } else {
+            (u_dq.d, u_dq.q)
+        };
 
         // Update saturation error for next PI iteration anti-windup:
-        self.u_dq_saturation = ClarkParkValue { 
-            d: u_d_sat - u_dq.d, 
+        self.u_dq_saturation = ClarkParkValue {
+            d: u_d_sat - u_dq.d,
             q: u_q_sat - u_dq.q
         };
 
@@ -116,7 +145,9 @@ impl FOC {
 
         // Update the parameter estimator:
         let data = FocIterationData {
-
+            measured_i_dq,
+            u_dq,
+            omega_e,
         };
         estimator.after_foc_iteration(data);
 
@@ -183,12 +214,13 @@ mod tests {
 
         let mut state = sim.state();
         let mut time_s = 0.0_f32;
-        let mut records = std::vec::Vec::new();
+        let mut records: std::vec::Vec<SimRecord> = std::vec::Vec::new();
         while time_s < 0.005 {
             let foc_input = FocInput {
                 command: FocInputType::TargetTorque(setpoint),
                 dc_bus_voltage: sim_cfg.dc_bus_voltage,
                 rotor_angle_rad: state.theta,
+                angle_type: AngleType::Mechanical,
                 rotor_angular_velocity_rad_s: state.omega,
                 phase_currents: state.currents
             };
@@ -211,6 +243,11 @@ mod tests {
                     "Step response settling time exceeded"
                 )
             }
+            assert!(
+                -5e-2 <= state.i_d && state.i_d <= 5e-2,
+                "d-axis current not correctly regulated: {} > {}",
+                state.i_d.abs(), 5e-2
+            );
 
             time_s += sim_dt;
         }

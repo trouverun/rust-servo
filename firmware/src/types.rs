@@ -63,7 +63,6 @@ impl Default for FirmwareConfig {
 }
 
 pub struct RuntimeValues {
-    pub rotor_lock_prompt: bool,
     pub target_velocity: f32,
     pub target_torque: f32,
 }
@@ -71,7 +70,6 @@ pub struct RuntimeValues {
 impl Default for RuntimeValues {
     fn default() -> Self {
         Self {
-            rotor_lock_prompt: false,
             target_velocity: 0.0, target_torque: 0.0
         }
     }

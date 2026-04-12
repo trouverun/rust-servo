@@ -2,10 +2,11 @@ extern crate std;
 use std::vec::Vec;
 use std::string::String;
 use plotly::{Plot, Scatter, Layout};
-use plotly::common::Mode;
+use plotly::common::{Fill, Line, LineShape, Mode};
 use plotly::layout::Axis;
 use crate::{DoesFocMath, FocInput, FocInputType, FocResult};
 use crate::sim::SimOutput;
+use crate::types::*;
 
 pub struct DummyAccelerator;
 impl DoesFocMath for DummyAccelerator {
@@ -17,6 +18,32 @@ impl DoesFocMath for DummyAccelerator {
 
     fn sqrt(&mut self, val: f32) -> f32 {
         val.sqrt()
+    }
+}
+
+pub struct ConstantMotorParameters {
+    pub params: MotorParams,
+}
+
+impl ConstantMotorParameters {
+    pub fn new(params: MotorParams) -> Self {
+        Self { params }
+    }
+
+    pub fn from_other<T>(&mut self, other: &T) where T: MotorParamEstimator {
+        self.params = other.get_params();
+    }
+}
+
+impl MotorParamEstimator for ConstantMotorParameters {
+    fn after_foc_iteration(&mut self, _data: FocIterationData) {}
+
+    fn get_params(&self) -> MotorParams {
+        self.params
+    }
+
+    fn parameters_valid(&self) -> bool {
+        false
     }
 }
 
@@ -65,26 +92,62 @@ pub fn plot_simulation(path: &str, dt: f32, records: &[SimRecord]) {
         }
     }).collect();
     let has_torque_target = target_torque.iter().any(|t| !t.is_nan());
+    let has_hall = records.iter().any(|r| r.sim.hall_pattern.is_some());
 
     let mut row = 1u32;
-    // 1. Rotor angle
+    // 1 (optional). Hall encoder signals (3 separate filled step traces)
+    if has_hall {
+        let colors = ["#1f77b4", "#ff7f0e", "#2ca02c"];
+        let labels = ["Hall A", "Hall B", "Hall C"];
+        let bits = [2u8, 1, 0]; // bit positions: A=bit2, B=bit1, C=bit0
+        for (i, (&bit, &color)) in bits.iter().zip(colors.iter()).enumerate() {
+            let offset = (2 - i) as f64; // A=2, B=1, C=0
+            let base: Vec<f64> = std::vec![offset; n];
+            let signal: Vec<f64> = records.iter().map(|r| {
+                let p = r.sim.hall_pattern.unwrap_or(0);
+                if (p >> bit) & 1 == 1 { offset + 0.8 } else { offset }
+            }).collect();
+            // Baseline trace (invisible, anchor for fill)
+            plot.add_trace(
+                Scatter::new(time.clone(), base)
+                    .mode(Mode::Lines)
+                    .line(Line::new().shape(LineShape::Hv).width(0.0))
+                    .show_legend(false)
+                    .x_axis(&xa_id(row))
+                    .y_axis(&ya_id(row))
+            );
+            // Signal trace with fill down to baseline
+            plot.add_trace(
+                Scatter::new(time.clone(), signal)
+                    .mode(Mode::Lines)
+                    .name(labels[i])
+                    .line(Line::new().shape(LineShape::Hv).color(color).width(0.5))
+                    .fill(Fill::ToNextY)
+                    .fill_color(color)
+                    .x_axis(&xa_id(row))
+                    .y_axis(&ya_id(row))
+            );
+        }
+        row += 1;
+    }
+    // Rotor angle
     plot.add_trace(line_trace(&time, &theta, "θ", row));
     row += 1;
-    // 2. Rotor speed
+    // Rotor speed
     plot.add_trace(line_trace(&time, &omega, "ω", row));
     row += 1;
-    // 3. Duty cycles
+    // Duty cycles
     plot.add_trace(line_trace(&time, &d_u, "D_u", row));
     plot.add_trace(line_trace(&time, &d_v, "D_v", row));
     plot.add_trace(line_trace(&time, &d_w, "D_w", row));
     row += 1;
-    // 4. D/Q voltages
+    // D/Q voltages
     let u_d: Vec<f32> = records.iter().map(|r| r.result.u_dq.d).collect();
     let u_q: Vec<f32> = records.iter().map(|r| r.result.u_dq.q).collect();
     plot.add_trace(line_trace(&time, &u_d, "U_d", row));
     plot.add_trace(line_trace(&time, &u_q, "U_q", row));
     row += 1;
-    // 5. D/Q axis currents
+    // D/Q axis currents
     let meas_id: Vec<f32> = records.iter().map(|r| r.result.measured_i_dq.d).collect();
     let meas_iq: Vec<f32> = records.iter().map(|r| r.result.measured_i_dq.q).collect();
     let tgt_id: Vec<f32> = records.iter().map(|r| r.result.target_i_dq.d).collect();
@@ -94,7 +157,7 @@ pub fn plot_simulation(path: &str, dt: f32, records: &[SimRecord]) {
     plot.add_trace(line_trace(&time, &tgt_id, "I_d target", row));
     plot.add_trace(line_trace(&time, &tgt_iq, "I_q target", row));
     row += 1;
-    // 6. Torque
+    // Torque
     let torque: Vec<f32> = records.iter().map(|r| r.sim.torque).collect();
     plot.add_trace(line_trace(&time, &torque, "torque", row));
     if has_torque_target {
@@ -113,27 +176,39 @@ pub fn plot_simulation(path: &str, dt: f32, records: &[SimRecord]) {
         [bottom, top]
     };
 
-    let xa = |r: u32, anchor: &str| -> Axis {
+    let xa = |_r: u32, anchor: &str| -> Axis {
         Axis::new().domain(&[0.0, 1.0]).anchor(anchor)
     };
     let ya = |r: u32, title: &str, anchor: &str| -> Axis {
         Axis::new().title(title).domain(&domain_for_row(r)).anchor(anchor)
     };
 
-    let layout = Layout::new()
-        .height(300 * num_rows as usize)
-        .x_axis(xa(1, "y"))
-        .x_axis2(xa(2, "y2"))
-        .x_axis3(xa(3, "y3"))
-        .x_axis4(xa(4, "y4"))
-        .x_axis5(xa(5, "y5"))
-        .x_axis6(xa(6, "y6"))
-        .y_axis(ya(1, "Rotor Angle [rad]", "x"))
-        .y_axis2(ya(2, "Rotor Speed [rad/s]", "x2"))
-        .y_axis3(ya(3, "Duty Cycles", "x3"))
-        .y_axis4(ya(4, "D/Q Voltages [V]", "x4"))
-        .y_axis5(ya(5, "D/Q Currents [A]", "x5"))
-        .y_axis6(ya(6, "Torque [Nm]", "x6"));
+    let mut row_labels: Vec<&str> = Vec::new();
+    if has_hall { row_labels.push("Hall Pattern"); }
+    row_labels.extend_from_slice(&[
+        "Rotor Angle [rad]", "Rotor Speed [rad/s]", "Duty Cycles",
+        "D/Q Voltages [V]", "D/Q Currents [A]", "Torque [Nm]",
+    ]);
+
+    let mut layout = Layout::new().height(300 * num_rows as usize);
+    for (i, title) in row_labels.iter().enumerate() {
+        let r = (i + 1) as u32;
+        let xa_anchor = ya_id(r);
+        let ya_anchor = xa_id(r);
+        let x = xa(r, &xa_anchor);
+        let y = ya(r, title, &ya_anchor);
+        // plotly-rs requires calling specific axis methods by index
+        layout = match r {
+            1 => layout.x_axis(x).y_axis(y),
+            2 => layout.x_axis2(x).y_axis2(y),
+            3 => layout.x_axis3(x).y_axis3(y),
+            4 => layout.x_axis4(x).y_axis4(y),
+            5 => layout.x_axis5(x).y_axis5(y),
+            6 => layout.x_axis6(x).y_axis6(y),
+            7 => layout.x_axis7(x).y_axis7(y),
+            _ => layout,
+        };
+    }
 
     plot.set_layout(layout);
     plot.write_html(path);
