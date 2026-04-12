@@ -1,28 +1,4 @@
-/// First-order IIR low-pass filter: y[k] = (1 - α) * y[k-1] + α * x[k-1]
-pub struct LowPassFilter {
-    alpha: f32,
-    prev_input: f32,
-    output: f32,
-}
-
-impl LowPassFilter {
-    pub fn new(cutoff_hz: f32, dt: f32) -> Self {
-        let omega_c = 2.0 * core::f32::consts::PI * cutoff_hz;
-        Self {
-            alpha: (omega_c * dt) / (1.0 + omega_c * dt),
-            prev_input: 0.0,
-            output: 0.0,
-        }
-    }
-
-    pub fn update(&mut self, input: f32) -> f32 {
-        self.output = (1.0 - self.alpha) * self.output + self.alpha * self.prev_input;
-        self.prev_input = input;
-        self.output
-    }
-}
-
-/// Accumulator for solving y = a*x via least-squares: a = Σ(x·y) / Σ(x²)
+/// Accumulator for solving y = a*x via least-squares: a = sum(x*y) / sum(x^2)
 pub struct Lse {
     xy_sum: f32,
     xx_sum: f32,
