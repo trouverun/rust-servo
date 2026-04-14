@@ -145,34 +145,29 @@ mod app {
                 });
             } else {
                 let dc_bus_voltage = cx.shared.board_status.lock(|bs| bs.dc_bus_voltage);
+                let (theta, omega, hall_pattern) = cx.shared.hall_feedback.lock(|hf| {
+                    let feedback = hf.read();
+                    (feedback.angle, feedback.velocity, hf.get_pattern())
+                });
                 cx.shared.motor_parameters.lock(|active_params| {
-                    // Determine FOC inputs based on operating mode (calibration vs torque/velocity control):
-                    let estimator: &mut dyn MotorParamEstimator;
+                    // Determine FOC inputs based on operating mode:
+                    let mut estimator: &mut dyn MotorParamEstimator = active_params;
                     let mut calibration_result = None;
                     let (theta, omega, foc_command) = if calibrating {
-                        let (theta, omega, hall_pattern) = cx.shared.hall_feedback.lock(|hf| {
-                            let feedback = hf.read();
-                            (feedback.angle, feedback.velocity, hf.get_pattern())
-                        });
                         let (target_voltage, target_current, target_speed) = cx.shared.config.lock(|cfg| {
                             (cfg.calibration_voltage, cfg.calibration_current, cfg.calibration_speed_rad_s)
                         });
                         let inputs = CalibrationInputs {
-                            rotor_angle: theta, hall_pattern, 
+                            rotor_angle: theta, hall_pattern,
                             num_pole_pairs: active_params.get_estimate().num_pole_pairs,
-                            target_voltage, target_current, target_speed 
+                            target_voltage, target_current, target_speed
                         };
                         let (output, stage_result) = cx.local.calibration.tick(inputs);
                         estimator = cx.local.calibration.get_estimator();
                         calibration_result = stage_result;
                         (output.rotor_angle_rad, omega, output.foc_command)
                     } else {
-                        let (theta, omega) = cx.shared.hall_feedback.lock(|hf| {
-                            let feedback = hf.read();
-                            (feedback.angle, feedback.velocity)
-                        });
                         let torque = cx.shared.runtime_values.lock(|rtv| rtv.target_torque);
-                        estimator = active_params;
                         (theta, omega, FocInputType::TargetTorque(torque))
                     };
 
@@ -222,7 +217,7 @@ mod app {
                             });
                             cx.shared.mode.lock(|mode| *mode = mode.on_command(Command::FinishCalibration));
                         }
-                        Some(StageResult::Failure) => {
+                        Some(StageResult::Failure { cause }) => {
                             // Move to fault or idle state
                         }
                         None => {} // Calibration step still in progress

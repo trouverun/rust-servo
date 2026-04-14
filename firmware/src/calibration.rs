@@ -20,6 +20,12 @@ pub struct CalibrationOutput {
     pub foc_command: FocInputType,
 }
 
+pub enum FailureCause {
+    MissingParameter,
+    MotorParameterEstimation,
+    PiTuning
+}
+
 /// Stage specific outputs / results
 pub enum StageResult {
     HallCalibration {
@@ -33,7 +39,9 @@ pub enum StageResult {
     Tuning {
         pi_gains: ControllerParameters,
     },
-    Failure
+    Failure {
+        cause: FailureCause
+    }
 }
 
 enum CalibrationPhase {
@@ -79,14 +87,16 @@ impl CalibrationRunner {
                     let result = StageResult::HallCalibration {
                         angle_table: self.hall_calibrator.hall_pattern_to_angle,
                     };
-                    self.phase = CalibrationPhase::MotorEstimation;
+                    // Number of pole pairs should have been configured already:
                     if let Some(num_pole_pairs) = inputs.num_pole_pairs {
+                        self.phase = CalibrationPhase::MotorEstimation;
                         self.motor_estimator.start(num_pole_pairs);
                         let output = self.motor_estimation_output(inputs);
                         (output, Some(result))
                     } else {
+                        self.phase = CalibrationPhase::Done;
                         let output = self.idle_output(inputs);
-                        (output, Some(StageResult::Failure))
+                        (output, Some(StageResult::Failure { cause: FailureCause::MissingParameter }))
                     }
                 } else {
                     const PWM_FREQ_HZ : u32 = PWM_FREQ.0;
@@ -110,6 +120,10 @@ impl CalibrationRunner {
                         motor_params: self.motor_estimator.get_estimate()
                     });
                     (output, result)
+                } else if self.motor_estimator.estimation_failed() {
+                    self.phase = CalibrationPhase::Done;
+                    let output = self.idle_output(inputs);
+                    (output, Some(StageResult::Failure { cause: FailureCause::MotorParameterEstimation }))
                 } else {
                     let output = self.motor_estimation_output(inputs);
                     (output, None)
@@ -125,11 +139,9 @@ impl CalibrationRunner {
                     if let Some(pi_gains) = pi_gains_opt {
                         let result = StageResult::Tuning { pi_gains };
                         return (output, Some(result))
-                    } else {
-                        return (output, Some(StageResult::Failure))
                     }
                 }
-                (output, Some(StageResult::Failure))
+                (output, Some(StageResult::Failure { cause: FailureCause::PiTuning }))
             }
             CalibrationPhase::Done => {
                 let output = self.idle_output(inputs);
