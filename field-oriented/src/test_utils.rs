@@ -21,32 +21,6 @@ impl DoesFocMath for DummyAccelerator {
     }
 }
 
-pub struct ConstantMotorParameters {
-    pub params: MotorParams,
-}
-
-impl ConstantMotorParameters {
-    pub fn new(params: MotorParams) -> Self {
-        Self { params }
-    }
-
-    pub fn from_other<T>(&mut self, other: &T) where T: MotorParamEstimator {
-        self.params = other.get_params();
-    }
-}
-
-impl MotorParamEstimator for ConstantMotorParameters {
-    fn after_foc_iteration(&mut self, _data: FocIterationData) {}
-
-    fn get_params(&self) -> MotorParams {
-        self.params
-    }
-
-    fn parameters_valid(&self) -> bool {
-        false
-    }
-}
-
 pub struct SimRecord {
     pub input: FocInput,
     pub result: FocResult,

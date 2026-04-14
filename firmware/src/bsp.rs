@@ -14,7 +14,7 @@ use embassy_stm32::cordic::{Cordic, Precision, NoScale, SqrtScale, Sin, Sqrt, Q1
 use embassy_stm32::pac::timer::{vals::{Bkp}};
 use embassy_stm32::timer::hall::{HallSensor};
 use embassy_stm32::cordic::utils::{f32_to_q1_15, q1_15_to_f32};
-use field_oriented::{ControllerParameters, HasRotorFeedback, MotorParams};
+use field_oriented::{ControllerParameters, HasRotorFeedback, MotorParamsEstimate};
 use crate::{boards::*, types::FirmwareConfig};
 use field_oriented::{DoesFocMath, RotorFeedback, SinCosResult, PhaseValues};
 
@@ -392,11 +392,11 @@ impl Memory {
 
     }
 
-    pub fn read_motor_parameters(&self) -> Option<MotorParams> {
+    pub fn read_motor_parameters(&self) -> Option<MotorParamsEstimate> {
         None
     }
 
-    pub fn write_motor_parameters(&self, params: MotorParams) {
+    pub fn write_motor_parameters(&self, params: MotorParamsEstimate) {
 
     }
 

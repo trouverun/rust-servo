@@ -30,6 +30,12 @@ impl HallCalibrator {
         }
     }
 
+    pub fn start(&mut self) {
+        self.state = CalibrationState::InitialSettle { waited_s: 0.0 };
+        self.iteration_counter = 0;
+        self.hall_pattern_to_angle = [0.0; 6];
+    }
+
     /// Increment the target rotor angle by a small amount
     pub fn calibration_step<const PWM_FREQ: u32>(
         &mut self, hall_pattern: u8, rotation_speed_rad_s: f32
@@ -97,7 +103,7 @@ mod test {
 
     use super::{HallCalibrator};
     use crate::{
-        ClarkParkValue, FOC, FocConfig, FocInput, MotorParams, ConstantMotorParameters,
+        ClarkParkValue, FOC, FocConfig, FocInput, MotorParams, ConstantMotorParameters, MotorParamsEstimate,
         PMSMConfig, PMSMSim, HallEncoder, FocInputType, AngleType, DummyAccelerator, plot_simulation, SimRecord
     };
 
@@ -113,17 +119,16 @@ mod test {
             saturation_d_ratio: 0.0
         };
         let mut foc = FOC::new(foc_cfg, pwm_freq_hz);
-
         let mut accelerator = DummyAccelerator;
-        let mut estimator = ConstantMotorParameters {
-            params: MotorParams {
+        let motor_params = MotorParamsEstimate::from_nominal(
+            MotorParams {
                 num_pole_pairs: sim_cfg.num_pole_pairs as u8,
                 stator_resistance: sim_cfg.stator_resistance,
                 d_inductance: sim_cfg.inductance,
                 q_inductance: sim_cfg.inductance,
                 pm_flux_linkage: sim_cfg.pm_flux_linkage
             }
-        };
+        );
         let mut calibrator = HallCalibrator::new(5.0, 0.01);
 
         let mut state = sim.state();
@@ -146,12 +151,12 @@ mod test {
                 phase_currents: state.currents
             };
 
-            let foc_result = foc.compute(foc_input, &mut accelerator, &mut estimator);
-            state = sim.step(foc_result);
+            let foc_result = foc.compute(foc_input, motor_params, &mut accelerator);
+            state = sim.step(foc_result.unwrap());
             if step % record_interval == 0 {
                 records.push(SimRecord {
                     input: foc_input,
-                    result: foc_result,
+                    result: foc_result.unwrap(),
                     sim: state,
                 });
             }

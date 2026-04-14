@@ -15,7 +15,6 @@ pub mod pac {
 
 #[rtic::app(device = crate::pac, peripherals = false, dispatchers = [SPI1, SPI2, SPI3])]
 mod app {
-    use core::{f32::consts::PI};
     use defmt::{info};
     use {defmt_rtt as _};
     use crate::calibration::{CalibrationInputs, CalibrationRunner, StageResult};
@@ -23,8 +22,7 @@ mod app {
     use crate::boards::*;
     use crate::types::*;
     use field_oriented::{
-        ConstantMotorParameters, FOC, FocConfig, FocInput, FocInputType, 
-        HasRotorFeedback, MotorParamEstimator, MotorParams, PhaseValues
+        AngleType, ConstantMotorParameters, FOC, FocConfig, FocInput, FocInputType, HasRotorFeedback, MotorParamEstimator, MotorParamsEstimate, PhaseValues
     };
 
     #[shared]
@@ -82,15 +80,10 @@ mod app {
 
         // Try to read calibrations and configurations from memory:
         let motor_parameters = if let Some(saved_parameters) = memory.read_motor_parameters() {
-            ConstantMotorParameters::new(saved_parameters)
+            ConstantMotorParameters::from_other(saved_parameters)
         } else {
-            ConstantMotorParameters { 
-                params: MotorParams {
-                    num_pole_pairs: 0,
-                    stator_resistance: 0.0,
-                    d_inductance: 0.0, q_inductance: 0.0,
-                    pm_flux_linkage: 0.0
-                } 
+            ConstantMotorParameters {
+                params: MotorParamsEstimate::new_empty()
             }
         };
         if let Some(hall_calibrations) = memory.read_hall_calibrations() {
@@ -143,75 +136,100 @@ mod app {
         let mut voltage_hexagon_sector = 0;
         if let Some(phase_currents) = cx.local.adc_feedback.read_currents() {
             if !active {
+                // TODO: need to come here also if: 
+                // motor params not fully populated OR
+                // PI gains invalid OR
+                // rotor feedback not set up
                 cx.shared.pwm_output.lock(|pwm| {
                     pwm.set_duty_cycles(PhaseValues { u: 0.0, v: 0.0, w: 0.0 })
                 });
             } else {
                 let dc_bus_voltage = cx.shared.board_status.lock(|bs| bs.dc_bus_voltage);
+                cx.shared.motor_parameters.lock(|active_params| {
+                    // Determine FOC inputs based on operating mode (calibration vs torque/velocity control):
+                    let estimator: &mut dyn MotorParamEstimator;
+                    let mut calibration_result = None;
+                    let (theta, omega, foc_command) = if calibrating {
+                        let (theta, omega, hall_pattern) = cx.shared.hall_feedback.lock(|hf| {
+                            let feedback = hf.read();
+                            (feedback.angle, feedback.velocity, hf.get_pattern())
+                        });
+                        let (target_voltage, target_current, target_speed) = cx.shared.config.lock(|cfg| {
+                            (cfg.calibration_voltage, cfg.calibration_current, cfg.calibration_speed_rad_s)
+                        });
+                        let inputs = CalibrationInputs {
+                            rotor_angle: theta, hall_pattern, 
+                            num_pole_pairs: active_params.get_estimate().num_pole_pairs,
+                            target_voltage, target_current, target_speed 
+                        };
+                        let (output, stage_result) = cx.local.calibration.tick(inputs);
+                        estimator = cx.local.calibration.get_estimator();
+                        calibration_result = stage_result;
+                        (output.rotor_angle_rad, omega, output.foc_command)
+                    } else {
+                        let (theta, omega) = cx.shared.hall_feedback.lock(|hf| {
+                            let feedback = hf.read();
+                            (feedback.angle, feedback.velocity)
+                        });
+                        let torque = cx.shared.runtime_values.lock(|rtv| rtv.target_torque);
+                        estimator = active_params;
+                        (theta, omega, FocInputType::TargetTorque(torque))
+                    };
 
-                // Determine FOC inputs based on calibration vs torque/velocity control mode:
-                let (theta, omega, foc_command, calibration_result) = if calibrating {
-                    let (theta, omega, hall_pattern) = cx.shared.hall_feedback.lock(|hf| {
-                        let feedback = hf.read();
-                        (feedback.angle, feedback.velocity, hf.get_pattern())
+                    // FOC computations:
+                    let foc_input = FocInput { 
+                        command: foc_command, dc_bus_voltage, 
+                        angle_type: AngleType::Electrical,
+                        rotor_angle_rad: theta, 
+                        rotor_angular_velocity_rad_s: omega,
+                        phase_currents 
+                    };
+                    let foc_result = cx.shared.acceleration.lock(|accelerator| {
+                        cx.local.foc.compute(foc_input, estimator.get_estimate(), accelerator)
                     });
-                    let (target_voltage, target_speed) = cx.shared.config.lock(|cfg| {
-                        (cfg.calibration_voltage, cfg.calibration_speed_rad_s)
-                    });
-                    let inputs = CalibrationInputs { hall_angle: theta, hall_pattern, target_voltage, target_speed };
-                    let (output, stage_result) = cx.local.calibration.tick(inputs);
-                    (output.rotor_angle_rad, omega, output.foc_command, stage_result)
-                } else {
-                    let (theta, omega) = cx.shared.hall_feedback.lock(|hf| {
-                        let feedback = hf.read();
-                        (feedback.angle, feedback.velocity)
-                    });                    
-                    let torque = cx.shared.runtime_values.lock(|rtv| rtv.target_torque);
-                    (theta, omega, FocInputType::TargetTorque(torque), None)
-                };
 
-                // FOC computations:
-                let foc_input = FocInput { 
-                    command: foc_command, dc_bus_voltage, 
-                    rotor_angle_rad: theta, 
-                    rotor_angular_velocity_rad_s: omega,
-                    phase_currents 
-                };
-                let foc_result = cx.shared.motor_parameters.lock(|params| {
-                    cx.shared.acceleration.lock(|acc| {
-                        cx.local.foc.compute(foc_input, acc, params)
-                    })
+                    cx.shared.pwm_output.lock(|pwm| {                
+                    match foc_result {
+                        Ok(result) => {
+                            // cx.shared.pwm_output.lock(|pwm| pwm.set_duty_cycles(foc_result.duty_cycles));
+                            estimator.after_foc_iteration(result);
+                            voltage_hexagon_sector = result.voltage_hexagon_sector;
+                        }
+                        Err(e) => {
+                            pwm.set_duty_cycles(PhaseValues { u: 0.0, v: 0.0, w: 0.0 })
+                            // Move to fault or idle state
+                        }
+                    }});
+
+                    // Apply calibration stage results:
+                    match calibration_result {
+                        Some(StageResult::HallCalibration { angle_table }) => {
+                            cx.shared.hall_feedback.lock(|hf| hf.set_calibration(angle_table));
+                            cx.shared.memory.lock(|m| {
+                                m.write_hall_calibrations(angle_table);
+                            });
+                        }
+                        Some(StageResult::MotorParameters { motor_params }) => {
+                            active_params.copy_other(motor_params);
+                            cx.shared.memory.lock(|m| {
+                                m.write_motor_parameters(motor_params);
+                            });
+                        }
+                        Some(StageResult::Tuning { pi_gains }) => {
+                            cx.local.foc.set_pi_gains(pi_gains);
+                            cx.shared.memory.lock(|m| {
+                                m.write_controller_parameters(pi_gains);
+                            });
+                            cx.shared.mode.lock(|mode| *mode = mode.on_command(Command::FinishCalibration));
+                        }
+                        Some(StageResult::Failure) => {
+                            // Move to fault or idle state
+                        }
+                        None => {} // Calibration step still in progress
+                    }
+
                 });
-                cx.shared.pwm_output.lock(|pwm| pwm.set_duty_cycles(foc_result.duty_cycles));
-                voltage_hexagon_sector = foc_result.voltage_hexagon_sector;
-
-                // Apply calibration stage results:
-                match calibration_result {
-                    // TODO: pole_count needs to somehow get to the shared motor_params (and persist there)
-                    Some(StageResult::HallCalibration { angle_table, pole_count }) => {
-                        cx.shared.hall_feedback.lock(|hf| hf.set_calibration(angle_table));
-                        cx.shared.memory.lock(|m| {
-                            m.write_hall_calibrations(angle_table);
-                        });
-                    }
-                    Some(StageResult::MotorParameters { motor_params, pi_gains }) => {
-                        cx.shared.motor_parameters.lock(|active_params| {
-                            active_params.from_other(&cx.local.calibration.motor_estimator);
-                        });
-                        cx.local.foc.set_pi_gains(pi_gains);
-                        cx.shared.memory.lock(|m| {
-                            m.write_motor_parameters(motor_params);
-                            m.write_controller_parameters(pi_gains);
-                        });
-                        cx.shared.mode.lock(|mode| *mode = mode.on_command(Command::FinishCalibration));
-                    }
-                    Some(StageResult::Failure) => {
-
-                    }
-                    None => {}
-                }
             }
-
             // Always sample something to keep the ADC EOC ISRs running:
             cx.local.adc_feedback.sample_sector(voltage_hexagon_sector);
         }

@@ -49,15 +49,17 @@ pub struct BoardStatus {
 }
 
 pub struct FirmwareConfig {
-    pub calibration_speed_rad_s: f32,
     pub calibration_voltage: f32,
+    pub calibration_current: f32,
+    pub calibration_speed_rad_s: f32,
 }
 
 impl Default for FirmwareConfig {
     fn default() -> Self {
         Self {
-            calibration_speed_rad_s: 25.0,
-            calibration_voltage: 0.0
+            calibration_voltage: 0.0,
+            calibration_current: 0.0,
+            calibration_speed_rad_s: 0.0,
         }
     }
 }

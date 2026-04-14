@@ -15,7 +15,11 @@ mod test_utils;
 pub use crate::types::*;
 use crate::{math::*, pi_control::PIGains};
 pub use crate::pi_control::{PIController, compute_current_pi_controller_gains};
-pub use crate::estimation::{HallCalibrator, OfflineMotorEstimator, OfflineEstimatorCommand, OfflineEstimatorOutput, OfflineEstimatorConfig};
+pub use crate::estimation::{
+    ConstantMotorParameters, HallCalibrator, OfflineMotorEstimator, OfflineEstimatorInput,
+    OfflineEstimatorCommand, OfflineEstimatorOutput, OfflineEstimatorConfig,
+    MotorParams, MotorParamsEstimate, MotorParamEstimator
+};
 #[cfg(test)]
 pub use crate::sim::*;
 #[cfg(test)]
@@ -42,7 +46,7 @@ impl FOC {
         let sampling_time_s = 1.0 / pwm_freq_hz;
 
         // Slow I controller for calibration steady-state use:
-        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 1e3, kt: 0.0 };
+        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 5e2, kt: 0.0 };
         let calibration_d_pi = PIController::new(calibration_gains, sampling_time_s);
         let calibration_q_pi = PIController::new(calibration_gains, sampling_time_s);
 
@@ -59,21 +63,20 @@ impl FOC {
         }
     }
 
-    pub fn compute<A, E>(&mut self, 
+    pub fn compute<A>(&mut self, 
         input: FocInput, 
-        accelerator: &mut A, 
-        estimator: &mut E
-    ) -> FocResult where A: DoesFocMath, E: MotorParamEstimator {
-        let motor_params = estimator.get_params();
-        let pp = match input.angle_type {
+        motor_params: MotorParamsEstimate,
+        accelerator: &mut A
+    ) -> Result<FocResult, FocFault> where A: DoesFocMath {
+        let pole_pairs = motor_params.num_pole_pairs.ok_or(FocFault::MissingMotorParams)?;
+        let angle_scaler = match input.angle_type {
             AngleType::Electrical => 1.0,
-            AngleType::Mechanical => motor_params.num_pole_pairs as f32,
+            AngleType::Mechanical => pole_pairs as f32,
         };
-        let theta_e = pp * input.rotor_angle_rad;
-        let omega_e = pp * input.rotor_angular_velocity_rad_s;
+        let theta_e = angle_scaler * input.rotor_angle_rad;
+        let omega_e = angle_scaler * input.rotor_angular_velocity_rad_s;
         let sc_e = accelerator.sin_cos(theta_e);
         let measured_i_dq = forward_clark_park(input.phase_currents, sc_e);
-
 
         let (u_dq, target_i_dq) = match input.command {
             FocInputType::TargetVoltage(voltage) => {
@@ -81,8 +84,9 @@ impl FOC {
             }
             FocInputType::TargetTorque(target_torque) => {
                 // Derive target q,d-axis currents from torque command:
-                let k_tau = if motor_params.num_pole_pairs != 0 && motor_params.pm_flux_linkage != 0.0 {
-                    0.666667 / (motor_params.num_pole_pairs as f32 * motor_params.pm_flux_linkage)
+                let pm_flux_linkage = motor_params.pm_flux_linkage.ok_or(FocFault::MissingMotorParams)?;
+                let k_tau = if pole_pairs != 0 && pm_flux_linkage != 0.0 {
+                    0.666667 / (pole_pairs as f32 * pm_flux_linkage)
                 } else {
                     0.0
                 };
@@ -92,8 +96,10 @@ impl FOC {
                 let mut u_q = self.q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
 
                 // Cross-coupling compensation feedforward:
-                u_d += -motor_params.q_inductance*measured_i_dq.q*omega_e;
-                u_q += omega_e*(motor_params.pm_flux_linkage + motor_params.d_inductance*measured_i_dq.d);
+                let q_inductance = motor_params.q_inductance.ok_or(FocFault::MissingMotorParams)?;
+                u_d += -q_inductance*measured_i_dq.q*omega_e;
+                let d_inductance =  motor_params.d_inductance.ok_or(FocFault::MissingMotorParams)?;
+                u_q += omega_e*(pm_flux_linkage + d_inductance*measured_i_dq.d);
 
                 (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
             }
@@ -143,21 +149,14 @@ impl FOC {
             w: (0.5 + bus_reciprocal*(v_tgt.w + v0_tgt)).clamp(0.0, 1.0)
         };
 
-        // Update the parameter estimator:
-        let data = FocIterationData {
-            measured_i_dq,
-            u_dq,
+        Ok(FocResult {
             omega_e,
-        };
-        estimator.after_foc_iteration(data);
-
-        FocResult {
             duty_cycles,
             voltage_hexagon_sector,
             measured_i_dq,
             target_i_dq,
             u_dq,
-        }
+        })
     }
 
     pub fn set_pi_gains(&mut self, gains: ControllerParameters) {
@@ -191,26 +190,25 @@ mod tests {
             saturation_d_ratio: 0.0
         };
         let mut foc = FOC::new(foc_cfg, pwm_freq_hz);
-
         let mut accelerator = DummyAccelerator;
-        let mut estimator = ConstantMotorParameters {
-            params: MotorParams { 
+        let motor_params = MotorParamsEstimate::from_nominal(
+            MotorParams { 
                 num_pole_pairs: sim_cfg.num_pole_pairs as u8,
                 stator_resistance: sim_cfg.stator_resistance, 
                 d_inductance: sim_cfg.inductance, 
                 q_inductance: sim_cfg.inductance,
                 pm_flux_linkage: sim_cfg.pm_flux_linkage
             }
-        };
+        );
 
-        if let Some(gains) = compute_current_pi_controller_gains::<50>(estimator.get_params(), pwm_freq_hz) {
+        if let Some(gains) = compute_current_pi_controller_gains::<50>(
+            motor_params.to_params().unwrap(), pwm_freq_hz
+        ) {
             foc.set_pi_gains(gains);
         } else {
             assert!(false, "Couldn't tune controller")
         }
-
-        let motor_params = estimator.get_params();
-        let iq_setpoint = 0.666667 / (motor_params.num_pole_pairs as f32 * motor_params.pm_flux_linkage) * setpoint;
+        let iq_setpoint = 0.666667 / (motor_params.num_pole_pairs.unwrap() as f32 * motor_params.pm_flux_linkage.unwrap()) * setpoint;
 
         let mut state = sim.state();
         let mut time_s = 0.0_f32;
@@ -224,7 +222,7 @@ mod tests {
                 rotor_angular_velocity_rad_s: state.omega,
                 phase_currents: state.currents
             };
-            let foc_result = foc.compute(foc_input, &mut accelerator, &mut estimator);
+            let foc_result = foc.compute(foc_input, motor_params, &mut accelerator).unwrap();
 
             state = sim.step(foc_result);
             records.push(SimRecord {
