@@ -46,7 +46,7 @@ impl FOC {
         let sampling_time_s = 1.0 / pwm_freq_hz;
 
         // Slow I controller for calibration steady-state use:
-        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 5e2, kt: 0.0 };
+        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 1e2, kt: 0.0 };
         let calibration_d_pi = PIController::new(calibration_gains, sampling_time_s);
         let calibration_q_pi = PIController::new(calibration_gains, sampling_time_s);
 
@@ -73,8 +73,8 @@ impl FOC {
             AngleType::Electrical => 1.0,
             AngleType::Mechanical => pole_pairs as f32,
         };
-        let theta_e = angle_scaler * input.rotor_angle_rad;
-        let omega_e = angle_scaler * input.rotor_angular_velocity_rad_s;
+        let theta_e = angle_scaler * input.theta;
+        let omega_e = angle_scaler * input.omega;
         let sc_e = accelerator.sin_cos(theta_e);
         let measured_i_dq = forward_clark_park(input.phase_currents, sc_e);
 
@@ -217,9 +217,9 @@ mod tests {
             let foc_input = FocInput {
                 command: FocInputType::TargetTorque(setpoint),
                 dc_bus_voltage: sim_cfg.dc_bus_voltage,
-                rotor_angle_rad: state.theta,
+                theta: state.theta,
                 angle_type: AngleType::Mechanical,
-                rotor_angular_velocity_rad_s: state.omega,
+                omega: state.omega,
                 phase_currents: state.currents
             };
             let foc_result = foc.compute(foc_input, motor_params, &mut accelerator).unwrap();

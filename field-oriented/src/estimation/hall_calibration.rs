@@ -145,9 +145,9 @@ mod test {
                 command: FocInputType::TargetCurrents(ClarkParkValue {
                     d: 0.5, q: 0.0
                 }),
-                rotor_angle_rad: angle,
+                theta: angle,
                 angle_type: AngleType::Electrical,
-                rotor_angular_velocity_rad_s: 0.0,
+                omega: 0.0,
                 phase_currents: state.currents
             };
 

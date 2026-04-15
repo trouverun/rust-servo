@@ -1,10 +1,10 @@
 pub struct RotorFeedback {
-    pub angle: f32,
-    pub velocity: f32
+    pub theta: f32,
+    pub omega: f32
 }
 
 pub trait HasRotorFeedback {
-    fn read(&self) -> RotorFeedback;
+    fn read(&mut self) -> RotorFeedback;
 }
 
 #[derive(Clone, Copy)]
@@ -59,8 +59,8 @@ pub struct FocInput {
     pub command: FocInputType,
     pub dc_bus_voltage: f32,
     pub angle_type: AngleType,
-    pub rotor_angle_rad: f32,
-    pub rotor_angular_velocity_rad_s: f32,
+    pub theta: f32,
+    pub omega: f32,
     pub phase_currents: PhaseValues,
 }
 

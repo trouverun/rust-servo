@@ -141,13 +141,13 @@ mod app {
                 // PI gains invalid OR
                 // rotor feedback not set up
                 cx.shared.pwm_output.lock(|pwm| {
-                    pwm.set_duty_cycles(PhaseValues { u: 0.0, v: 0.0, w: 0.0 })
+                    // pwm.set_duty_cycles(PhaseValues { u: 0.0, v: 0.0, w: 0.0 })
                 });
             } else {
                 let dc_bus_voltage = cx.shared.board_status.lock(|bs| bs.dc_bus_voltage);
                 let (theta, omega, hall_pattern) = cx.shared.hall_feedback.lock(|hf| {
                     let feedback = hf.read();
-                    (feedback.angle, feedback.velocity, hf.get_pattern())
+                    (feedback.theta, feedback.omega, hf.get_pattern())
                 });
                 cx.shared.motor_parameters.lock(|active_params| {
                     // Determine FOC inputs based on operating mode:
@@ -158,14 +158,14 @@ mod app {
                             (cfg.calibration_voltage, cfg.calibration_current, cfg.calibration_speed_rad_s)
                         });
                         let inputs = CalibrationInputs {
-                            rotor_angle: theta, hall_pattern,
+                            theta, hall_pattern,
                             num_pole_pairs: active_params.get_estimate().num_pole_pairs,
                             target_voltage, target_current, target_speed
                         };
                         let (output, stage_result) = cx.local.calibration.tick(inputs);
                         estimator = cx.local.calibration.get_estimator();
                         calibration_result = stage_result;
-                        (output.rotor_angle_rad, omega, output.foc_command)
+                        (output.theta, omega, output.foc_command)
                     } else {
                         let torque = cx.shared.runtime_values.lock(|rtv| rtv.target_torque);
                         (theta, omega, FocInputType::TargetTorque(torque))
@@ -175,8 +175,8 @@ mod app {
                     let foc_input = FocInput { 
                         command: foc_command, dc_bus_voltage, 
                         angle_type: AngleType::Electrical,
-                        rotor_angle_rad: theta, 
-                        rotor_angular_velocity_rad_s: omega,
+                        theta,
+                        omega,
                         phase_currents 
                     };
                     let foc_result = cx.shared.acceleration.lock(|accelerator| {
@@ -191,7 +191,7 @@ mod app {
                             voltage_hexagon_sector = result.voltage_hexagon_sector;
                         }
                         Err(e) => {
-                            pwm.set_duty_cycles(PhaseValues { u: 0.0, v: 0.0, w: 0.0 })
+                            // pwm.set_duty_cycles(PhaseValues { u: 0.0, v: 0.0, w: 0.0 })
                             // Move to fault or idle state
                         }
                     }});

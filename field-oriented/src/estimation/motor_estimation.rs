@@ -163,12 +163,12 @@ pub enum OfflineEstimatorOutput {
 pub struct OfflineEstimatorInput {
     pub target_voltage: f32,
     pub target_current: f32,
-    pub rotor_angle: f32
+    pub theta: f32
 }
 
 pub struct OfflineEstimatorCommand {
     pub output: OfflineEstimatorOutput,
-    pub rotor_angle: f32,
+    pub theta: f32,
 }
 
 pub struct OfflineEstimatorConfig {
@@ -207,23 +207,23 @@ impl OfflineMotorEstimator {
         match &self.state {
             OfflineEstimatorState::RotorLockWait { .. } => OfflineEstimatorCommand {
                 output: OfflineEstimatorOutput::Current(ClarkParkValue { d: input.target_current, q: 0.0 }),
-                rotor_angle: 0.0,
+                theta: 0.0,
             },
             OfflineEstimatorState::EstR { .. } => OfflineEstimatorCommand {
                 output: OfflineEstimatorOutput::Current(ClarkParkValue { d: input.target_current, q: 0.0 }),
-                rotor_angle: 0.0,
+                theta: 0.0,
             },
             OfflineEstimatorState::EstL { voltage_sign, .. } => OfflineEstimatorCommand {
                 output: OfflineEstimatorOutput::Voltage(ClarkParkValue { d: *voltage_sign * input.target_voltage, q: 0.0 }),
-                rotor_angle: 0.0,
+                theta: 0.0,
             },
             OfflineEstimatorState::EstF { .. } => OfflineEstimatorCommand {
                 output: OfflineEstimatorOutput::Current(ClarkParkValue { d: 0.0, q: input.target_current }),
-                rotor_angle: input.rotor_angle,
+                theta: input.theta,
             },
             _ => OfflineEstimatorCommand {
                 output: OfflineEstimatorOutput::Current(ClarkParkValue { d: 0.0, q: 0.0 }),
-                rotor_angle: 0.0,
+                theta: 0.0,
             },
         }
     }
@@ -309,12 +309,12 @@ mod test {
         let timeout = 3.0;
 
         while !estimator.estimation_done() {
-            let rotor_angle = state.theta * sim_cfg.num_pole_pairs as f32;
-            let rotor_velocity = state.omega * sim_cfg.num_pole_pairs as f32;
+            let theta_e = state.theta * sim_cfg.num_pole_pairs as f32;
+            let omega_e = state.omega * sim_cfg.num_pole_pairs as f32;
             let step_in = OfflineEstimatorInput {
-                target_voltage: max_voltage, 
-                target_current: max_current, 
-                rotor_angle
+                target_voltage: max_voltage,
+                target_current: max_current,
+                theta: theta_e
             };
             let cmd = estimator.step(step_in);
 
@@ -325,9 +325,9 @@ mod test {
             let foc_input = FocInput {
                 dc_bus_voltage: sim_cfg.dc_bus_voltage,
                 command,
-                rotor_angle_rad: cmd.rotor_angle,
+                theta: cmd.theta,
                 angle_type: AngleType::Electrical,
-                rotor_angular_velocity_rad_s: rotor_velocity,
+                omega: omega_e,
                 phase_currents: state.currents,
             };
 

@@ -6,7 +6,7 @@ use field_oriented::{
 };
 
 pub struct CalibrationInputs {
-    pub rotor_angle: f32,
+    pub theta: f32,
     pub hall_pattern: u8,
     pub num_pole_pairs: Option<u8>,
     pub target_voltage: f32,
@@ -16,7 +16,7 @@ pub struct CalibrationInputs {
 
 /// Outputs needed regardless of stage
 pub struct CalibrationOutput {
-    pub rotor_angle_rad: f32,
+    pub theta: f32,
     pub foc_command: FocInputType,
 }
 
@@ -104,7 +104,7 @@ impl CalibrationRunner {
                         inputs.hall_pattern, inputs.target_speed
                     );
                     let output = CalibrationOutput {
-                        rotor_angle_rad: angle,
+                        theta: angle,
                         foc_command: FocInputType::TargetCurrents(ClarkParkValue {
                             d: inputs.target_current, q: 0.0
                         })
@@ -154,7 +154,7 @@ impl CalibrationRunner {
         let step_input = OfflineEstimatorInput {
             target_voltage: inputs.target_voltage,
             target_current: inputs.target_current,
-            rotor_angle: inputs.rotor_angle
+            theta: inputs.theta
         };
         let estimator_command = self.motor_estimator.step(step_input);
         let foc_command = match estimator_command.output {
@@ -162,14 +162,14 @@ impl CalibrationRunner {
             OfflineEstimatorOutput::Voltage(u_dq) => FocInputType::TargetVoltage(u_dq),
         };
         CalibrationOutput {
-            rotor_angle_rad: estimator_command.rotor_angle,
+            theta: estimator_command.theta,
             foc_command
         }
     }
 
     fn idle_output(&self, inputs: CalibrationInputs) -> CalibrationOutput {
         CalibrationOutput {
-            rotor_angle_rad: inputs.rotor_angle,
+            theta: inputs.theta,
             foc_command: FocInputType::TargetVoltage(ClarkParkValue { d: 0.0, q: 0.0 }),
         }
     }

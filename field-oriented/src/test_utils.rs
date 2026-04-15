@@ -69,7 +69,6 @@ pub fn plot_simulation(path: &str, dt: f32, records: &[SimRecord]) {
     let has_hall = records.iter().any(|r| r.sim.hall_pattern.is_some());
 
     let mut row = 1u32;
-    // 1 (optional). Hall encoder signals (3 separate filled step traces)
     if has_hall {
         let colors = ["#1f77b4", "#ff7f0e", "#2ca02c"];
         let labels = ["Hall A", "Hall B", "Hall C"];

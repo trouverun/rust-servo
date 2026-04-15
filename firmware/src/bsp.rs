@@ -229,14 +229,37 @@ impl AdcFeedback {
 pub struct HallFeedback {
     pub sensor: HallSensor<'static, HallFeedbackTimer>,
     hall_pattern_to_angle: [f32; 6],
+    /// Unsigned angular span of each hall sector, indexed by pattern - 1.
+    /// Computed from the calibration table: distance from this edge to the next edge in the forward direction.
+    sector_span: [f32; 6],
+    /// Forward hall sequence: sector_span[pattern] leads to forward_next[pattern].
+    /// Used to determine rotation direction from pattern transitions.
+    forward_next: [u8; 6],
+    filtered_velocity: f32,
+    prev_raw_velocity: f32,
 }
 
 #[cfg(feature = "hall-feedback")]
 impl HallFeedback {
+    const LOWPASS_CUTOFF_HZ: f32 = 1_000.0;
+    const LOWPASS_ALPHA: f32 = {
+        let x = -TAU * Self::LOWPASS_CUTOFF_HZ / PWM_FREQ.0 as f32;
+        // Pade approximation of exp(x) (f32::exp() is not const fn):
+        let x2 = x * x;
+        let x3 = x2 * x;
+        let num = 1.0 + x / 2.0 + x2 / 10.0 + x3 / 120.0;
+        let den = 1.0 - x / 2.0 + x2 / 10.0 - x3 / 120.0;
+        num / den
+    };
+
     pub fn new(mappings: HallFeedbackMappings) -> Self {
         Self {
             sensor: mappings.sensor,
-            hall_pattern_to_angle: [0.0; 6]
+            hall_pattern_to_angle: [0.0; 6],
+            sector_span: [0.0; 6],
+            forward_next: [0; 6],
+            filtered_velocity: 0.0,
+            prev_raw_velocity: 0.0,
         }
     }
 
@@ -246,27 +269,85 @@ impl HallFeedback {
 
     pub fn set_calibration(&mut self, calibrations: [f32; 6]) {
         self.hall_pattern_to_angle = calibrations;
+
+        // Build (angle, pattern) pairs and sort by angle.
+        // This gives the forward (increasing angle) sequence.
+        // Hall patterns are 1..=6, stored at index pattern-1.
+        let mut by_angle: [(f32, u8); 6] = core::array::from_fn(|i| (calibrations[i], (i + 1) as u8));
+        for i in 1..6 {
+            let mut j = i;
+            while j > 0 && by_angle[j].0 < by_angle[j - 1].0 {
+                by_angle.swap(j, j - 1);
+                j -= 1;
+            }
+        }
+
+        // Walk the sorted sequence. For each pattern, record:
+        //  - which pattern comes next in the forward direction
+        //  - the angular distance to that next edge (wrapping around at 2pi)
+        for i in 0..6 {
+            let (angle, pattern) = by_angle[i];
+            let (next_angle, next_pattern) = by_angle[(i + 1) % 6];
+            let idx = (pattern - 1) as usize;
+
+            self.forward_next[idx] = next_pattern;
+
+            let mut span = next_angle - angle;
+            if span < 0.0 {
+                span += core::f32::consts::TAU;
+            }
+            self.sector_span[idx] = span;
+        }
     }
 
     pub fn on_interrupt(&mut self) {
         self.sensor.on_interrupt();
     }
+
+    /// Determine rotation direction from a pattern transition.
+    /// Returns 1 for forward, -1 for reverse, 0 if patterns are equal.
+    fn direction(&self, prev_pattern: u8, pattern: u8) -> i8 {
+        if prev_pattern == pattern {
+            return 0;
+        }
+        let prev_idx = prev_pattern.wrapping_sub(1) as usize;
+        if prev_idx < 6 && self.forward_next[prev_idx] == pattern {
+            1
+        } else {
+            -1
+        }
+    }
 }
 
 #[cfg(feature = "hall-feedback")]
 impl HasRotorFeedback for HallFeedback {
-    fn read(&self) -> RotorFeedback {
+    fn read(&mut self) -> RotorFeedback {
+        // Todo: return Result so caller can deal with invalid patterns 000 and 111
         let raw_state = self.sensor.read_state();
-        RotorFeedback {
-            angle: 0.0,
-            velocity: 0.0
-        }
+        let idx = (raw_state.pattern.wrapping_sub(1) as usize).min(5);
+        let dir = self.direction(raw_state.prev_pattern, raw_state.pattern);
+        let span = self.sector_span[idx];
+
+        // Size of the current Hall sector in electrical angle radians:
+        let signed_span = dir as f32 * span;
+        // Fraction of current sector elapsed (dimensionless: counter/period, ticks cancel)
+        let fraction = raw_state.counter as f32 * raw_state.hall_period_reciprocal_cycles;
+
+        let angle = self.hall_pattern_to_angle[idx] + signed_span * fraction;
+        let raw_velocity = signed_span * raw_state.hall_period_reciprocal_cycles * self.sensor.timer_frequency_reciprocal_s;
+
+        // IIR low-pass: y[n] = alpha*y[n-1] + (1-alpha)*x[n-1]
+        let alpha = Self::LOWPASS_ALPHA;
+        self.filtered_velocity = alpha * self.filtered_velocity + (1.0 - alpha) * self.prev_raw_velocity;
+        self.prev_raw_velocity = raw_velocity;
+
+        RotorFeedback { theta: angle, omega: self.filtered_velocity }
     }
 }
 
 pub struct PwmOutput {
     #[cfg(feature = "overcurrent-comparators")]
-    comparators: CurrentComparators,
+    _comparators: CurrentComparators,
     pwm: PWM<'static, PwmTimer, PwmRunning>
 }
 
@@ -287,7 +368,7 @@ impl PwmOutput {
         }
 
         Self {
-            comparators: mappings.comparators,
+            _comparators: mappings.comparators,
             pwm: tmp.start()
         }
     }

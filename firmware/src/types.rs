@@ -57,9 +57,9 @@ pub struct FirmwareConfig {
 impl Default for FirmwareConfig {
     fn default() -> Self {
         Self {
-            calibration_voltage: 0.0,
-            calibration_current: 0.0,
-            calibration_speed_rad_s: 0.0,
+            calibration_voltage: 6.0,
+            calibration_current: 0.33,
+            calibration_speed_rad_s: 33.0,
         }
     }
 }
