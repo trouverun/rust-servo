@@ -154,13 +154,13 @@ mod app {
                     let mut estimator: &mut dyn MotorParamEstimator = active_params;
                     let mut calibration_result = None;
                     let (theta, omega, foc_command) = if calibrating {
-                        let (target_voltage, target_current, target_speed) = cx.shared.config.lock(|cfg| {
-                            (cfg.calibration_voltage, cfg.calibration_current, cfg.calibration_speed_rad_s)
+                        let (target_voltage, target_current, target_omega) = cx.shared.config.lock(|cfg| {
+                            (cfg.calibration_voltage, cfg.calibration_current, cfg.calibration_omega)
                         });
                         let inputs = CalibrationInputs {
                             theta, hall_pattern,
                             num_pole_pairs: active_params.get_estimate().num_pole_pairs,
-                            target_voltage, target_current, target_speed
+                            target_voltage, target_current, target_omega
                         };
                         let (output, stage_result) = cx.local.calibration.tick(inputs);
                         estimator = cx.local.calibration.get_estimator();

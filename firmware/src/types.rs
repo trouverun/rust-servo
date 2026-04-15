@@ -51,7 +51,7 @@ pub struct BoardStatus {
 pub struct FirmwareConfig {
     pub calibration_voltage: f32,
     pub calibration_current: f32,
-    pub calibration_speed_rad_s: f32,
+    pub calibration_omega: f32,
 }
 
 impl Default for FirmwareConfig {
@@ -59,7 +59,7 @@ impl Default for FirmwareConfig {
         Self {
             calibration_voltage: 6.0,
             calibration_current: 0.33,
-            calibration_speed_rad_s: 33.0,
+            calibration_omega: 33.0,
         }
     }
 }

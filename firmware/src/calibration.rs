@@ -11,7 +11,7 @@ pub struct CalibrationInputs {
     pub num_pole_pairs: Option<u8>,
     pub target_voltage: f32,
     pub target_current: f32,
-    pub target_speed: f32,
+    pub target_omega: f32,
 }
 
 /// Outputs needed regardless of stage
@@ -101,7 +101,7 @@ impl CalibrationRunner {
                 } else {
                     const PWM_FREQ_HZ : u32 = PWM_FREQ.0;
                     let angle = self.hall_calibrator.calibration_step::<PWM_FREQ_HZ>(
-                        inputs.hall_pattern, inputs.target_speed
+                        inputs.hall_pattern, inputs.target_omega
                     );
                     let output = CalibrationOutput {
                         theta: angle,
