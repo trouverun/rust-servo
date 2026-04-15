@@ -228,7 +228,7 @@ impl AdcFeedback {
 #[cfg(feature = "hall-feedback")]
 pub struct HallFeedback {
     pub sensor: HallSensor<'static, HallFeedbackTimer>,
-    hall_pattern_to_angle: [f32; 6],
+    hall_pattern_to_theta: [f32; 6],
     /// Unsigned angular span of each hall sector, indexed by pattern - 1.
     /// Computed from the calibration table: distance from this edge to the next edge in the forward direction.
     sector_span: [f32; 6],
@@ -255,7 +255,7 @@ impl HallFeedback {
     pub fn new(mappings: HallFeedbackMappings) -> Self {
         Self {
             sensor: mappings.sensor,
-            hall_pattern_to_angle: [0.0; 6],
+            hall_pattern_to_theta: [0.0; 6],
             sector_span: [0.0; 6],
             forward_next: [0; 6],
             filtered_velocity: 0.0,
@@ -268,7 +268,7 @@ impl HallFeedback {
     }
 
     pub fn set_calibration(&mut self, calibrations: [f32; 6]) {
-        self.hall_pattern_to_angle = calibrations;
+        self.hall_pattern_to_theta = calibrations;
 
         // Build (angle, pattern) pairs and sort by angle.
         // This gives the forward (increasing angle) sequence.
@@ -333,7 +333,7 @@ impl HasRotorFeedback for HallFeedback {
         // Fraction of current sector elapsed (dimensionless: counter/period, ticks cancel)
         let fraction = raw_state.counter as f32 * raw_state.hall_period_reciprocal_cycles;
 
-        let angle = self.hall_pattern_to_angle[idx] + signed_span * fraction;
+        let angle = self.hall_pattern_to_theta[idx] + signed_span * fraction;
         let raw_velocity = signed_span * raw_state.hall_period_reciprocal_cycles * self.sensor.timer_frequency_reciprocal_s;
 
         // IIR low-pass: y[n] = alpha*y[n-1] + (1-alpha)*x[n-1]

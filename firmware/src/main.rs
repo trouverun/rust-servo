@@ -311,7 +311,7 @@ mod app {
 
         if let Some(val) = adc_reading {
             cx.shared.runtime_values.lock(|rc| {
-                rc.target_velocity = val;
+                rc.target_omega = val;
             });
         }
     }

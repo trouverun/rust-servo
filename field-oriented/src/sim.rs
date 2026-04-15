@@ -47,7 +47,7 @@ impl HallEncoder {
     }
 
     /// Returns the electrical edge angle where the given pattern becomes active.
-    pub fn edge_angle(&self, pattern: u8) -> Option<f32> {
+    pub fn edge_theta(&self, pattern: u8) -> Option<f32> {
         self.patterns.iter().position(|&p| p == pattern).map(|i| self.edges[i])
     }
 

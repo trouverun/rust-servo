@@ -65,14 +65,14 @@ impl Default for FirmwareConfig {
 }
 
 pub struct RuntimeValues {
-    pub target_velocity: f32,
+    pub target_omega: f32,
     pub target_torque: f32,
 }
 
 impl Default for RuntimeValues {
     fn default() -> Self {
         Self {
-            target_velocity: 0.0, target_torque: 0.0
+            target_omega: 0.0, target_torque: 0.0
         }
     }
 }

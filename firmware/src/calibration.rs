@@ -85,7 +85,7 @@ impl CalibrationRunner {
             CalibrationPhase::HallCalibration => {
                 if self.hall_calibrator.check_calibration_done() {
                     let result = StageResult::HallCalibration {
-                        angle_table: self.hall_calibrator.hall_pattern_to_angle,
+                        angle_table: self.hall_calibrator.hall_pattern_to_theta,
                     };
                     // Number of pole pairs should have been configured already:
                     if let Some(num_pole_pairs) = inputs.num_pole_pairs {

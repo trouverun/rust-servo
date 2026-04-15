@@ -4,7 +4,7 @@ enum CalibrationState {
     InitialSettle { waited_s: f32 },
     Sweeping {
         waited_s: f32,
-        target_angle_rad: f32,
+        target_theta: f32,
         first_edge: Option<u8>,
         prev_pattern: u8,
     },
@@ -16,7 +16,7 @@ pub struct HallCalibrator {
     iteration_counter: u32,
     initial_settle_time_s: f32,
     step_settle_time_s: f32,
-    pub hall_pattern_to_angle: [f32; 6],
+    pub hall_pattern_to_theta: [f32; 6],
 }
 
 impl HallCalibrator {
@@ -24,7 +24,7 @@ impl HallCalibrator {
         Self {
             state: CalibrationState::InitialSettle { waited_s: 0.0 },
             iteration_counter: 0,
-            hall_pattern_to_angle: [0.0; 6],
+            hall_pattern_to_theta: [0.0; 6],
             initial_settle_time_s,
             step_settle_time_s,
         }
@@ -33,12 +33,12 @@ impl HallCalibrator {
     pub fn start(&mut self) {
         self.state = CalibrationState::InitialSettle { waited_s: 0.0 };
         self.iteration_counter = 0;
-        self.hall_pattern_to_angle = [0.0; 6];
+        self.hall_pattern_to_theta = [0.0; 6];
     }
 
     /// Increment the target rotor angle by a small amount
     pub fn calibration_step<const PWM_FREQ: u32>(
-        &mut self, hall_pattern: u8, rotation_speed_rad_s: f32
+        &mut self, hall_pattern: u8, omega: f32
     ) -> f32 {
         // Step by 100 FOC ISRs at a time (10-20 kHz to 100-200 Hz)
         if self.iteration_counter >= 100 {
@@ -49,17 +49,17 @@ impl HallCalibrator {
                     if *waited_s >= self.initial_settle_time_s {
                         self.state = CalibrationState::Sweeping {
                             waited_s: 0.0,
-                            target_angle_rad: 0.0,
+                            target_theta: 0.0,
                             first_edge: None,
                             prev_pattern: hall_pattern,
                         };
                     }
                 }
-                CalibrationState::Sweeping { waited_s, target_angle_rad, first_edge, prev_pattern } => {
+                CalibrationState::Sweeping { waited_s, target_theta, first_edge, prev_pattern } => {
                     if *waited_s >= self.step_settle_time_s {
-                        *target_angle_rad += rotation_speed_rad_s * time_passed_s;
-                        if *target_angle_rad >= 2.0*PI {
-                            *target_angle_rad -= 2.0*PI;
+                        *target_theta += omega * time_passed_s;
+                        if *target_theta >= 2.0*PI {
+                            *target_theta -= 2.0*PI;
                         }
                         if *prev_pattern != hall_pattern {
                             if let Some(pattern) = first_edge {
@@ -71,7 +71,7 @@ impl HallCalibrator {
                                 *first_edge = Some(hall_pattern);
                             }
                             let idx = (hall_pattern.clamp(1, 6) - 1) as usize;
-                            self.hall_pattern_to_angle[idx] = *target_angle_rad;
+                            self.hall_pattern_to_theta[idx] = *target_theta;
                         }
                         *waited_s = 0.0;
                         *prev_pattern = hall_pattern;
@@ -87,7 +87,7 @@ impl HallCalibrator {
         }
 
         match &self.state {
-            CalibrationState::Sweeping { target_angle_rad, .. } => *target_angle_rad,
+            CalibrationState::Sweeping { target_theta, .. } => *target_theta,
             _ => 0.0,
         }
     }
@@ -171,9 +171,9 @@ mod test {
 
         if let Some(encoder) = sim.hall_encoder {
             let tolerance = 0.02;
-            for (i, &angle) in calibrator.hall_pattern_to_angle.iter().enumerate() {
+            for (i, &angle) in calibrator.hall_pattern_to_theta.iter().enumerate() {
                 let pattern = (i + 1) as u8;
-                let expected: f32 = encoder.edge_angle(pattern).unwrap();
+                let expected: f32 = encoder.edge_theta(pattern).unwrap();
                 let d = angle - expected;
                 let error = d.sin().atan2(d.cos()).abs();
                 assert!(error < tolerance, "pattern {pattern}: got {angle:.3}, expected {expected:.3}");
