@@ -14,7 +14,7 @@ use embassy_stm32::cordic::{Cordic, Precision, NoScale, SqrtScale, Sin, Sqrt, Q1
 use embassy_stm32::pac::timer::{vals::{Bkp}};
 use embassy_stm32::timer::hall::{HallSensor};
 use embassy_stm32::cordic::utils::{f32_to_q1_15, q1_15_to_f32};
-use field_oriented::{ControllerParameters, HasRotorFeedback, MotorParamsEstimate};
+use field_oriented::{ControllerParameters, HasRotorFeedback, MotorParamsEstimate, RotorFeedbackFault};
 use crate::{boards::*, types::FirmwareConfig};
 use field_oriented::{DoesFocMath, RotorFeedback, SinCosResult, PhaseValues};
 
@@ -209,8 +209,8 @@ impl AdcFeedback {
             5 => (self.v_channel.get_hw_channel(), self.w_channel.get_hw_channel()), 
             _ => return ()
         };
-        self.adc_a.insert_injected_context(&[source_a], Adc345InjectedTrigger::Tim8Trgo2, Exten::RISING_EDGE);
-        self.adc_b.insert_injected_context(&[source_b], Adc345InjectedTrigger::Tim8Trgo2, Exten::RISING_EDGE);
+        self.adc_a.insert_injected_context(&[source_a], FEEDBACK_TRIGGER_A, Exten::RISING_EDGE);
+        self.adc_b.insert_injected_context(&[source_b], FEEDBACK_TRIGGER_B, Exten::RISING_EDGE);
         self.sampled_sector = sector;
     }
 
@@ -228,13 +228,13 @@ impl AdcFeedback {
 #[cfg(feature = "hall-feedback")]
 pub struct HallFeedback {
     pub sensor: HallSensor<'static, HallFeedbackTimer>,
-    hall_pattern_to_theta: [f32; 6],
+    hall_pattern_to_theta: Option<[f32; 6]>,
     /// Unsigned angular span of each hall sector, indexed by pattern - 1.
     /// Computed from the calibration table: distance from this edge to the next edge in the forward direction.
-    sector_span: [f32; 6],
+    sector_span: Option<[f32; 6]>,
     /// Forward hall sequence: sector_span[pattern] leads to forward_next[pattern].
     /// Used to determine rotation direction from pattern transitions.
-    forward_next: [u8; 6],
+    forward_next: Option<[u8; 6]>,
     filtered_velocity: f32,
     prev_raw_velocity: f32,
 }
@@ -255,9 +255,9 @@ impl HallFeedback {
     pub fn new(mappings: HallFeedbackMappings) -> Self {
         Self {
             sensor: mappings.sensor,
-            hall_pattern_to_theta: [0.0; 6],
-            sector_span: [0.0; 6],
-            forward_next: [0; 6],
+            hall_pattern_to_theta: None,
+            sector_span: None,
+            forward_next: None,
             filtered_velocity: 0.0,
             prev_raw_velocity: 0.0,
         }
@@ -268,7 +268,7 @@ impl HallFeedback {
     }
 
     pub fn set_calibration(&mut self, calibrations: [f32; 6]) {
-        self.hall_pattern_to_theta = calibrations;
+        self.hall_pattern_to_theta = Some(calibrations);
 
         // Build (angle, pattern) pairs and sort by angle.
         // This gives the forward (increasing angle) sequence.
@@ -285,19 +285,23 @@ impl HallFeedback {
         // Walk the sorted sequence. For each pattern, record:
         //  - which pattern comes next in the forward direction
         //  - the angular distance to that next edge (wrapping around at 2pi)
+        let mut forward_next = [0; 6];
+        let mut sector_span = [0.0; 6];
         for i in 0..6 {
             let (angle, pattern) = by_angle[i];
             let (next_angle, next_pattern) = by_angle[(i + 1) % 6];
             let idx = (pattern - 1) as usize;
 
-            self.forward_next[idx] = next_pattern;
+            forward_next[idx] = next_pattern;
 
             let mut span = next_angle - angle;
             if span < 0.0 {
                 span += core::f32::consts::TAU;
             }
-            self.sector_span[idx] = span;
+            sector_span[idx] = span;
         }
+        self.forward_next = Some(forward_next);
+        self.sector_span = Some(sector_span);
     }
 
     pub fn on_interrupt(&mut self) {
@@ -306,12 +310,12 @@ impl HallFeedback {
 
     /// Determine rotation direction from a pattern transition.
     /// Returns 1 for forward, -1 for reverse, 0 if patterns are equal.
-    fn direction(&self, prev_pattern: u8, pattern: u8) -> i8 {
+    fn direction(&self, forward_next: [u8; 6], prev_pattern: u8, pattern: u8) -> i8 {
         if prev_pattern == pattern {
             return 0;
         }
         let prev_idx = prev_pattern.wrapping_sub(1) as usize;
-        if prev_idx < 6 && self.forward_next[prev_idx] == pattern {
+        if prev_idx < 6 && forward_next[prev_idx] == pattern {
             1
         } else {
             -1
@@ -321,19 +325,23 @@ impl HallFeedback {
 
 #[cfg(feature = "hall-feedback")]
 impl HasRotorFeedback for HallFeedback {
-    fn read(&mut self) -> RotorFeedback {
+    fn read(&mut self) -> Result<RotorFeedback, RotorFeedbackFault> {
         // Todo: return Result so caller can deal with invalid patterns 000 and 111
+        let hall_pattern_to_theta = self.hall_pattern_to_theta.ok_or(RotorFeedbackFault::NotCalibrated)?;
+        let forward_next = self.forward_next.ok_or(RotorFeedbackFault::NotCalibrated)?;
+        let sector_span = self.sector_span.ok_or(RotorFeedbackFault::NotCalibrated)?;
+
         let raw_state = self.sensor.read_state();
         let idx = (raw_state.pattern.wrapping_sub(1) as usize).min(5);
-        let dir = self.direction(raw_state.prev_pattern, raw_state.pattern);
-        let span = self.sector_span[idx];
+        let dir = self.direction(forward_next, raw_state.prev_pattern, raw_state.pattern);
+        let span = sector_span[idx];
 
         // Size of the current Hall sector in electrical angle radians:
         let signed_span = dir as f32 * span;
         // Fraction of current sector elapsed (dimensionless: counter/period, ticks cancel)
         let fraction = raw_state.counter as f32 * raw_state.hall_period_reciprocal_cycles;
 
-        let angle = self.hall_pattern_to_theta[idx] + signed_span * fraction;
+        let angle = hall_pattern_to_theta[idx] + signed_span * fraction;
         let raw_velocity = signed_span * raw_state.hall_period_reciprocal_cycles * self.sensor.timer_frequency_reciprocal_s;
 
         // IIR low-pass: y[n] = alpha*y[n-1] + (1-alpha)*x[n-1]
@@ -341,7 +349,7 @@ impl HasRotorFeedback for HallFeedback {
         self.filtered_velocity = alpha * self.filtered_velocity + (1.0 - alpha) * self.prev_raw_velocity;
         self.prev_raw_velocity = raw_velocity;
 
-        RotorFeedback { theta: angle, omega: self.filtered_velocity }
+        Ok(RotorFeedback { theta: angle, omega: self.filtered_velocity })
     }
 }
 

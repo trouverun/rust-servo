@@ -1,4 +1,5 @@
 pub enum Command {
+    Idle,
     StartCalibration,
     FinishCalibration,
     EnableTorqueControl,
@@ -10,18 +11,26 @@ pub enum OperatingMode {
     Idle,
     Calibration,
     TorqueControl,
-    VelocityControl
+    VelocityControl,
+    Fault
 }
 
 impl OperatingMode {
     pub fn on_command(&self, command: Command) -> Self {
         match (self, command) {
             (OperatingMode::Idle, Command::StartCalibration) => OperatingMode::Calibration,
-            (OperatingMode::Calibration, Command::FinishCalibration) => OperatingMode::Idle,
             (OperatingMode::Idle, Command::EnableTorqueControl) => OperatingMode::TorqueControl,
+            (OperatingMode::Calibration, Command::FinishCalibration) => OperatingMode::Idle,
+            (OperatingMode::TorqueControl, Command::Idle) => OperatingMode::Idle,
             (_, _) => *self
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum EdgeType {
+    Rising,
+    Falling,
 }
 
 #[derive(Clone, Copy)]
@@ -30,14 +39,14 @@ pub enum ButtonState {
     LongPress,
     ShortPress,
     DoublePress
-}   
+}
 
 impl ButtonState {
-    pub fn on_edge(&self, rising: bool) -> Self {
-        match (self, rising) {
-            (ButtonState::Waiting, true) => ButtonState::LongPress,
-            (ButtonState::LongPress, false) => ButtonState::ShortPress,
-            (ButtonState::ShortPress, true) => ButtonState::DoublePress,
+    pub fn on_edge(&self, edge: EdgeType) -> Self {
+        match (self, edge) {
+            (ButtonState::Waiting, EdgeType::Rising) => ButtonState::LongPress,
+            (ButtonState::LongPress, EdgeType::Falling) => ButtonState::ShortPress,
+            (ButtonState::ShortPress, EdgeType::Rising) => ButtonState::DoublePress,
             (_, _) => *self
         }
     }

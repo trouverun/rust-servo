@@ -1,10 +1,14 @@
+pub enum RotorFeedbackFault {
+    NotCalibrated
+}
+
 pub struct RotorFeedback {
     pub theta: f32,
     pub omega: f32
 }
 
 pub trait HasRotorFeedback {
-    fn read(&mut self) -> RotorFeedback;
+    fn read(&mut self) -> Result<RotorFeedback, RotorFeedbackFault>;
 }
 
 #[derive(Clone, Copy)]

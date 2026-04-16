@@ -17,12 +17,13 @@ pub mod pac {
 mod app {
     use defmt::{info};
     use {defmt_rtt as _};
-    use crate::calibration::{CalibrationInputs, CalibrationRunner, StageResult};
-    use crate::{bsp::{self, Acceleration, AdcFeedback, HallFeedback, Memory, PwmOutput}, types::{OperatingMode, BoardStatus}};
+    use crate::{calibration::{CalibrationInputs, CalibrationRunner, StageResult}, types::ButtonState};
+    use crate::bsp::{self, Acceleration, AdcFeedback, HallFeedback, Memory, PwmOutput};
+    use crate::types::{OperatingMode, BoardStatus};
     use crate::boards::*;
     use crate::types::*;
     use field_oriented::{
-        AngleType, ConstantMotorParameters, FOC, FocConfig, FocInput, FocInputType, HasRotorFeedback, MotorParamEstimator, MotorParamsEstimate, PhaseValues
+        AngleType, ConstantMotorParameters, FOC, FocConfig, FocInput, FocInputType, HasRotorFeedback, MotorParamEstimator, MotorParamsEstimate, RotorFeedback, compute_current_pi_controller_gains
     };
 
     #[shared]
@@ -60,7 +61,7 @@ mod app {
         ) = map_peripherals(p);
         
         let pwm_output = bsp::PwmOutput::new(pwm_mappings);
-        pwm_output.wait_break2_ready(); // Shows active low for first N cycles, wait it out
+        // pwm_output.wait_break2_ready(); // Shows active low for first N cycles, wait it out
         let adc_feedback = bsp::AdcFeedback::new(adc_mappings);
         let mut hall_feedback = bsp::HallFeedback::new(hall_mappings);
         let acceleration = bsp::Acceleration::new(accel_mappings);
@@ -79,7 +80,7 @@ mod app {
         let mut foc = FOC::new(foc_cfg, PWM_FREQ.0 as f32);
 
         // Try to read calibrations and configurations from memory:
-        let motor_parameters = if let Some(saved_parameters) = memory.read_motor_parameters() {
+        let mut motor_parameters = if let Some(saved_parameters) = memory.read_motor_parameters() {
             ConstantMotorParameters::from_other(saved_parameters)
         } else {
             ConstantMotorParameters {
@@ -92,6 +93,15 @@ mod app {
         if let Some(controller_parameters) = memory.read_controller_parameters() {
             foc.set_pi_gains(controller_parameters);
         }
+
+        // Testing:
+        motor_parameters.params.num_pole_pairs = Some(2);
+        motor_parameters.params.stator_resistance = Some(0.66);
+        motor_parameters.params.d_inductance = Some(0.00184);
+        motor_parameters.params.q_inductance = Some(0.00184);
+        motor_parameters.params.pm_flux_linkage = Some(0.0167);
+        let gains = compute_current_pi_controller_gains::<50>(motor_parameters.params.to_params().unwrap(), PWM_FREQ.0 as f32);
+        foc.set_pi_gains(gains.unwrap());
 
         (Shared {
             mode: OperatingMode::Idle,
@@ -135,7 +145,12 @@ mod app {
         // ADC injected EOC (FOC ISR):
         let mut voltage_hexagon_sector = 0;
         if let Some(phase_currents) = cx.local.adc_feedback.read_currents() {
-            if !active {
+
+            let (rotor_feedback, hall_pattern) = cx.shared.hall_feedback.lock(|hf| {
+                (hf.read(), hf.get_pattern())
+            });
+
+            if !active || rotor_feedback.is_err() {
                 // TODO: need to come here also if: 
                 // motor params not fully populated OR
                 // PI gains invalid OR
@@ -143,12 +158,8 @@ mod app {
                 cx.shared.pwm_output.lock(|pwm| {
                     // pwm.set_duty_cycles(PhaseValues { u: 0.0, v: 0.0, w: 0.0 })
                 });
-            } else {
+            } else if let Ok(RotorFeedback { theta, omega } ) = rotor_feedback {
                 let dc_bus_voltage = cx.shared.board_status.lock(|bs| bs.dc_bus_voltage);
-                let (theta, omega, hall_pattern) = cx.shared.hall_feedback.lock(|hf| {
-                    let feedback = hf.read();
-                    (feedback.theta, feedback.omega, hf.get_pattern())
-                });
                 cx.shared.motor_parameters.lock(|active_params| {
                     // Determine FOC inputs based on operating mode:
                     let mut estimator: &mut dyn MotorParamEstimator = active_params;
@@ -265,14 +276,14 @@ mod app {
     // ---------------------- Debug user inputs: -----------------------------------
     #[task(binds = EXTI15_10, shared=[debug_mappings, button_state], priority = 1)]
     fn on_exti15_10(mut cx: on_exti15_10::Context) {
-        let rising = cx.shared.debug_mappings.lock(|dm| {
+        let edge = cx.shared.debug_mappings.lock(|dm| {
             dm.user_btn.clear_pending();
-            dm.user_btn.is_low()
+            if dm.user_btn.is_low() { EdgeType::Rising } else { EdgeType::Falling }
         });
         cx.shared.button_state.lock(|bs| {
-            *bs = bs.on_edge(rising);
+            *bs = bs.on_edge(edge);
         });
-        if rising {
+        if matches!(edge, EdgeType::Rising) {
             cx.shared.debug_mappings.lock(|dm| {
                 dm.btn_timer.start();
             });
@@ -284,8 +295,14 @@ mod app {
         let press_type = cx.shared.button_state.lock(|bs| *bs);
         cx.shared.mode.lock(|mode| {
             match press_type {
+                ButtonState::ShortPress => {
+                    *mode = mode.on_command(Command::Idle)
+                }
+                ButtonState::DoublePress => {
+                    *mode = mode.on_command(Command::EnableTorqueControl)
+                }
                 ButtonState::LongPress => {
-                    *mode = mode.on_command(Command::StartCalibration);
+                    // *mode = mode.on_command(Command::StartCalibration);
                 }
                 _ => {}
             }
@@ -298,7 +315,7 @@ mod app {
         cx.shared.button_state.lock(|bs| *bs = ButtonState::Waiting);
     }
 
-    const POT_RECIPROCAL: f32 = 50.0 / ((1 << 12) - 1) as f32;
+    const POT_RECIPROCAL: f32 = 1.0 / ((1 << 12) - 1) as f32;
     #[task(binds = ADC1_2, shared=[debug_mappings, runtime_values], priority = 1)]
     fn on_adc12(mut cx: on_adc12::Context) {
         let adc_reading = cx.shared.debug_mappings.lock(|dm| {
@@ -311,7 +328,7 @@ mod app {
 
         if let Some(val) = adc_reading {
             cx.shared.runtime_values.lock(|rc| {
-                rc.target_omega = val;
+                rc.target_torque = val;
             });
         }
     }
