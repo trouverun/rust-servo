@@ -4,6 +4,7 @@ use crate::{
 use super::utils::Lse;
 
 enum StepFault {
+    MissingParameter,
     DegenSolution,
     ParameterOutOfBounds
 }
@@ -13,6 +14,14 @@ enum StepResult {
     EstimateR { resistance: f32, next: OfflineEstimatorState },
     EstimateL { d_inductance: f32, next: OfflineEstimatorState },
     EstimateF { pm_flux_linkage: f32 },
+}
+
+pub struct OfflineEstimatorConfig {
+    pub settle_time_s: f32,
+    pub test_time_s: f32,
+    pub spin_time_s: f32,
+    pub min_spin_omega: f32,
+    pub dt: f32,
 }
 
 enum OfflineEstimatorState {
@@ -58,6 +67,7 @@ impl OfflineEstimatorState {
         data: &FocResult,
         config: &OfflineEstimatorConfig,
         omega_e: f32,
+        num_pole_pairs: u8
     ) -> Result<Option<StepResult>, StepFault> {
         let dt = config.dt;
         match self {
@@ -81,7 +91,7 @@ impl OfflineEstimatorState {
                 lse.accumulate(data.measured_i_dq.d, data.u_dq.d);
                 *waited_s += dt;
                 if *waited_s >= config.test_time_s {
-                    let resistance = lse.solve().ok_or(StepFault::DegenSolution)?;
+                    let resistance = lse.solve(100).ok_or(StepFault::DegenSolution)?;
                     let result = Some(StepResult::EstimateR {
                         resistance,
                         next: Self::EstL {
@@ -120,7 +130,7 @@ impl OfflineEstimatorState {
                 *voltage_sign *= -1.0;
                 *waited_s += dt;
                 if *waited_s >= config.test_time_s {
-                    let d_inductance = lse.solve().ok_or(StepFault::DegenSolution)?;
+                    let d_inductance = lse.solve(100).ok_or(StepFault::DegenSolution)?;
                     let result = Some(StepResult::EstimateL {
                         d_inductance,
                         next: Self::EstF {
@@ -140,11 +150,14 @@ impl OfflineEstimatorState {
                 // v_q - R*i_q = pm_flux * omega_e
                 let x = omega_e;
                 let y = data.u_dq.q - *resistance * data.measured_i_dq.q;
-                lse.accumulate(x, y);
-                *waited_s += dt;
 
+                if omega_e.abs() / num_pole_pairs as f32 > config.min_spin_omega {
+                    lse.accumulate(x, y);
+                }
+                
+                *waited_s += dt;
                 if *waited_s >= config.spin_time_s {
-                    let pm_flux_linkage = lse.solve().ok_or(StepFault::DegenSolution)?;
+                    let pm_flux_linkage = lse.solve(100).ok_or(StepFault::DegenSolution)?;
                     let result = Some(StepResult::EstimateF { pm_flux_linkage });
                     Ok(result)
                 } else {
@@ -169,13 +182,6 @@ pub struct OfflineEstimatorInput {
 pub struct OfflineEstimatorCommand {
     pub output: OfflineEstimatorOutput,
     pub theta: f32,
-}
-
-pub struct OfflineEstimatorConfig {
-    pub settle_time_s: f32,
-    pub test_time_s: f32,
-    pub spin_time_s: f32,
-    pub dt: f32,
 }
 
 pub struct OfflineMotorEstimator {
@@ -241,33 +247,38 @@ impl OfflineMotorEstimator {
 
 impl MotorParamEstimator for OfflineMotorEstimator {
     fn after_foc_iteration(&mut self, data: FocResult) {
-        match self.state.step(&data, &self.config, data.omega_e) {
-            Err(fault) => {
-                self.state = OfflineEstimatorState::Failure { fault }
-            }
-            Ok(Some(result)) => {
-                match result {
-                    StepResult::Transition(next) => {
-                        self.state = next;
-                    }
-                    StepResult::EstimateR { resistance, next } => {
-                        self.params.stator_resistance = Some(resistance);
-                        self.state = next;
-                    }
-                    StepResult::EstimateL { d_inductance, next } => {
-                        self.params.d_inductance = Some(d_inductance);
-                        self.params.q_inductance = Some(d_inductance);
-                        self.state = next;
-                    }
-                    StepResult::EstimateF { pm_flux_linkage } => {
-                        self.params.pm_flux_linkage = Some(pm_flux_linkage);
-                        self.state = OfflineEstimatorState::Done;
+        if let Some(num_pole_pairs) = self.params.num_pole_pairs {
+            match self.state.step(&data, &self.config, data.omega_e, num_pole_pairs) {
+                Err(fault) => {
+                    self.state = OfflineEstimatorState::Failure { fault }
+                }
+                Ok(Some(result)) => {
+                    match result {
+                        StepResult::Transition(next) => {
+                            self.state = next;
+                        }
+                        StepResult::EstimateR { resistance, next } => {
+                            self.params.stator_resistance = Some(resistance);
+                            self.state = next;
+                        }
+                        StepResult::EstimateL { d_inductance, next } => {
+                            self.params.d_inductance = Some(d_inductance);
+                            self.params.q_inductance = Some(d_inductance);
+                            self.state = next;
+                        }
+                        StepResult::EstimateF { pm_flux_linkage } => {
+                            self.params.pm_flux_linkage = Some(pm_flux_linkage);
+                            self.state = OfflineEstimatorState::Done;
+                        }
                     }
                 }
+                Ok(None) => {}
             }
-            Ok(None) => {}
+        } else {
+            self.state = OfflineEstimatorState::Failure { fault: StepFault::MissingParameter }
         }
     }
+    
     fn get_estimate(&self) -> MotorParamsEstimate {
         self.params
     }
@@ -300,6 +311,7 @@ mod test {
             settle_time_s: 0.5,
             test_time_s: 0.5,
             spin_time_s: 5.0,
+            min_spin_omega: 50.0,
             dt,
         };
         let mut estimator = OfflineMotorEstimator::new(est_config);
