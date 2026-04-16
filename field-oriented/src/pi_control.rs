@@ -44,7 +44,10 @@ impl PIController {
         let proportional = self.gains.kp * e;
         // I:
         let anti_windup_term = self.gains.kt * saturation_error;
-        self.integral_term += self.sampling_time_s * self.gains.ki * (e + anti_windup_term);
+        self.integral_term = (
+            self.integral_term 
+            + self.sampling_time_s * self.gains.ki * (e + anti_windup_term)
+        ).clamp(-1000.0, 1000.0); // Clamp just to avoid NaN's in worst case
         
         proportional + self.integral_term
     }

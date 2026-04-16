@@ -3,104 +3,89 @@ use core::f32::consts::PI;
 enum CalibrationState {
     InitialSettle { waited_s: f32 },
     Sweeping {
-        waited_s: f32,
         target_theta: f32,
         first_edge: Option<u8>,
         prev_pattern: u8,
+        num_edges: u8
     },
-    Done,
+    Done {target_theta: f32},
 }
+
 
 pub struct HallCalibrator {
     state: CalibrationState,
-    iteration_counter: u32,
     initial_settle_time_s: f32,
-    step_settle_time_s: f32,
     pub hall_pattern_to_theta: [f32; 6],
 }
 
 impl HallCalibrator {
-    pub fn new(initial_settle_time_s: f32, step_settle_time_s: f32) -> Self {
+    pub fn new(initial_settle_time_s: f32) -> Self {
         Self {
             state: CalibrationState::InitialSettle { waited_s: 0.0 },
-            iteration_counter: 0,
             hall_pattern_to_theta: [0.0; 6],
             initial_settle_time_s,
-            step_settle_time_s,
         }
     }
 
     pub fn start(&mut self) {
         self.state = CalibrationState::InitialSettle { waited_s: 0.0 };
-        self.iteration_counter = 0;
         self.hall_pattern_to_theta = [0.0; 6];
     }
 
-    /// Increment the target rotor angle by a small amount
+    /// Increment the target rotor angle continuously each FOC iteration
     pub fn calibration_step<const PWM_FREQ: u32>(
         &mut self, hall_pattern: u8, omega: f32
     ) -> f32 {
-        // Step by 100 FOC ISRs at a time (10-20 kHz to 100-200 Hz)
-        if self.iteration_counter >= 100 {
-            let time_passed_s: f32 = 100.0 / PWM_FREQ as f32;
-            match &mut self.state {
-                CalibrationState::InitialSettle { waited_s } => {
-                    *waited_s += time_passed_s;
-                    if *waited_s >= self.initial_settle_time_s {
-                        self.state = CalibrationState::Sweeping {
-                            waited_s: 0.0,
-                            target_theta: 0.0,
-                            first_edge: None,
-                            prev_pattern: hall_pattern,
-                        };
-                    }
+        let dt: f32 = 1.0 / PWM_FREQ as f32;
+        match &mut self.state {
+            CalibrationState::InitialSettle { waited_s } => {
+                *waited_s += dt;
+                if *waited_s >= self.initial_settle_time_s {
+                    self.state = CalibrationState::Sweeping {
+                        target_theta: 0.0,
+                        first_edge: None,
+                        prev_pattern: hall_pattern,
+                        num_edges: 0
+                    };
                 }
-                CalibrationState::Sweeping { waited_s, target_theta, first_edge, prev_pattern } => {
-                    if *waited_s >= self.step_settle_time_s {
-                        *target_theta += omega * time_passed_s;
-                        if *target_theta >= 2.0*PI {
-                            *target_theta -= 2.0*PI;
-                        }
-                        if *prev_pattern != hall_pattern {
-                            if let Some(pattern) = first_edge {
-                                if *pattern == hall_pattern {
-                                    self.state = CalibrationState::Done;
-                                    return 0.0;
-                                }
-                            } else {
-                                *first_edge = Some(hall_pattern);
-                            }
-                            let idx = (hall_pattern.clamp(1, 6) - 1) as usize;
-                            self.hall_pattern_to_theta[idx] = *target_theta;
-                        }
-                        *waited_s = 0.0;
-                        *prev_pattern = hall_pattern;
-                    } else {
-                        *waited_s += time_passed_s;
-                    }
-                }
-                CalibrationState::Done => {}
+                0.0
             }
-            self.iteration_counter = 0;
-        } else {
-            self.iteration_counter += 1;
-        }
+            CalibrationState::Sweeping { target_theta, first_edge, prev_pattern, num_edges} => {
+                if *prev_pattern != hall_pattern {
+                    if let Some(first_pattern) = first_edge {
+                        if *first_pattern == hall_pattern && *num_edges >= 5 {
+                            let theta = *target_theta;
+                            self.state = CalibrationState::Done { target_theta: theta };
+                            return theta;
+                        }
+                    } else {
+                        *first_edge = Some(hall_pattern);
+                    }
+                    let idx = (hall_pattern.clamp(1, 6) - 1) as usize;
+                    self.hall_pattern_to_theta[idx] = *target_theta;
+                    *num_edges += 1;
+                }
+                *prev_pattern = hall_pattern;
 
-        match &self.state {
-            CalibrationState::Sweeping { target_theta, .. } => *target_theta,
-            _ => 0.0,
+                *target_theta += omega * dt;
+                if *target_theta >= 2.0*PI {
+                    *target_theta -= 2.0*PI;
+                }
+
+                return *target_theta
+            }
+            CalibrationState::Done {target_theta } => *target_theta,
         }
     }
 
     pub fn check_calibration_done(&self) -> bool {
-        matches!(self.state, CalibrationState::Done)
+        matches!(self.state, CalibrationState::Done{..})
     }
 }
 
 #[cfg(test)]
 mod test {
     use core::f32::consts::PI;
-
     use super::{HallCalibrator};
     use crate::{
         ClarkParkValue, FOC, FocConfig, FocInput, MotorParams, ConstantMotorParameters, MotorParamsEstimate,
@@ -129,7 +114,7 @@ mod test {
                 pm_flux_linkage: sim_cfg.pm_flux_linkage
             }
         );
-        let mut calibrator = HallCalibrator::new(5.0, 0.01);
+        let mut calibrator = HallCalibrator::new(5.0);
 
         let mut state = sim.state();
         let mut t = 0.0;
@@ -138,14 +123,14 @@ mod test {
         let mut records: std::vec::Vec<SimRecord> = std::vec::Vec::new();
         while !calibrator.check_calibration_done() {
             let pattern = state.hall_pattern.unwrap();
-            let angle = calibrator.calibration_step::<20_000>(pattern, 1.0);
+            let theta = calibrator.calibration_step::<20_000>(pattern, 0.43);
 
             let foc_input = FocInput {
                 dc_bus_voltage: 24.0,
                 command: FocInputType::TargetCurrents(ClarkParkValue {
                     d: 0.5, q: 0.0
                 }),
-                theta: angle,
+                theta,
                 angle_type: AngleType::Electrical,
                 omega: 0.0,
                 phase_currents: state.currents
@@ -170,7 +155,7 @@ mod test {
         }
 
         if let Some(encoder) = sim.hall_encoder {
-            let tolerance = 0.02;
+            let tolerance = 0.01;
             for (i, &angle) in calibrator.hall_pattern_to_theta.iter().enumerate() {
                 let pattern = (i + 1) as u8;
                 let expected: f32 = encoder.edge_theta(pattern).unwrap();

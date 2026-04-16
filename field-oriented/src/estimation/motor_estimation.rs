@@ -143,7 +143,7 @@ impl OfflineEstimatorState {
                 lse.accumulate(x, y);
                 *waited_s += dt;
 
-                if *waited_s >= config.test_time_s {
+                if *waited_s >= config.spin_time_s {
                     let pm_flux_linkage = lse.solve().ok_or(StepFault::DegenSolution)?;
                     let result = Some(StepResult::EstimateF { pm_flux_linkage });
                     Ok(result)
@@ -174,6 +174,7 @@ pub struct OfflineEstimatorCommand {
 pub struct OfflineEstimatorConfig {
     pub settle_time_s: f32,
     pub test_time_s: f32,
+    pub spin_time_s: f32,
     pub dt: f32,
 }
 
@@ -298,6 +299,7 @@ mod test {
         let est_config = OfflineEstimatorConfig {
             settle_time_s: 0.5,
             test_time_s: 0.5,
+            spin_time_s: 5.0,
             dt,
         };
         let mut estimator = OfflineMotorEstimator::new(est_config);
@@ -306,7 +308,7 @@ mod test {
         let mut state = sim.state();
         let mut t = 0.0;
         let mut records: std::vec::Vec<SimRecord> = std::vec::Vec::new();
-        let timeout = 3.0;
+        let timeout = 10.0;
 
         while !estimator.estimation_done() {
             let theta_e = state.theta * sim_cfg.num_pole_pairs as f32;

@@ -46,7 +46,7 @@ impl FOC {
         let sampling_time_s = 1.0 / pwm_freq_hz;
 
         // Slow I controller for calibration steady-state use:
-        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 1e2, kt: 0.0 };
+        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 1.0, kt: 0.5 };
         let calibration_d_pi = PIController::new(calibration_gains, sampling_time_s);
         let calibration_q_pi = PIController::new(calibration_gains, sampling_time_s);
 
@@ -82,6 +82,11 @@ impl FOC {
             FocInputType::TargetVoltage(voltage) => {
                 (voltage, ClarkParkValue { d: 0.0, q: 0.0 })
             }
+            FocInputType::TargetCurrents(target_i_dq) => {
+                let u_d = self.calibration_d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
+                let u_q = self.calibration_q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
+                (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
+            }
             FocInputType::TargetTorque(target_torque) => {
                 // Derive target q,d-axis currents from torque command:
                 let pm_flux_linkage = motor_params.pm_flux_linkage.ok_or(FocFault::MissingMotorParams)?;
@@ -101,11 +106,6 @@ impl FOC {
                 let d_inductance =  motor_params.d_inductance.ok_or(FocFault::MissingMotorParams)?;
                 u_q += omega_e*(pm_flux_linkage + d_inductance*measured_i_dq.d);
 
-                (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
-            }
-            FocInputType::TargetCurrents(target_i_dq) => {
-                let u_d = self.calibration_d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
-                let u_q = self.calibration_q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
                 (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
             }
         };
@@ -169,6 +169,13 @@ impl FOC {
             d_pi: self.d_pi.get_gains(),
             q_pi: self.q_pi.get_gains()
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.calibration_d_pi.reset();
+        self.calibration_q_pi.reset();
+        self.d_pi.reset();
+        self.q_pi.reset();
     }
 }
 
