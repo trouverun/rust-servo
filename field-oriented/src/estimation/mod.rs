@@ -4,7 +4,7 @@ pub(crate) mod utils;
 pub use hall_calibration::{HallCalibrator};
 pub use motor_estimation::{
     OfflineMotorEstimator, OfflineEstimatorCommand, OfflineEstimatorOutput, 
-    OfflineEstimatorConfig, OfflineEstimatorInput
+    OfflineEstimatorConfig, OfflineEstimatorInput, EstimationStepFault
 };
 use crate::types::{FocResult};
 
@@ -17,7 +17,7 @@ pub struct MotorParams {
     pub pm_flux_linkage: f32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, defmt::Format)]
 pub struct MotorParamsEstimate {
     pub num_pole_pairs: Option<u8>,
     pub stator_resistance: Option<f32>,

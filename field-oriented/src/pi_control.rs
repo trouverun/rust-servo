@@ -3,7 +3,7 @@ use libm::{cosf, expf, powf, sinf};
 use num_complex::{Complex32};
 
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, defmt::Format)]
 pub struct PIGains {
     /// Set point filter "gain" (1 / time constant)
     pub kr: f32,
@@ -80,9 +80,9 @@ pub fn compute_current_pi_controller_gains<const N: usize>(
     // Symbolically computed form for poles that give 5% overshoot and 1ms settling time:
     // (for a first order, decoupled motor model controlled by PI controller)
     let C1 = expf((R*T)/L);
-    let C2 = expf(-8000.0*T);
+    let C2 = expf(-800.0*T);
     let kp = R*C1 * (expf(-(R*T)/L) - C2) / (C1 - 1.0);
-    let ki = R*C1 * (C2 - 2.0*expf(-4000.0*T)*cosf(4194.757564*T) + 1.0) / (T*(C1 - 1.0));
+    let ki = R*C1 * (C2 - 2.0*expf(-400.0*T)*cosf(419.4757564*T) + 1.0) / (T*(C1 - 1.0));
     let z0 = kp/(kp+T*ki); // Zero cancellation setpoint filter
 
     let gains = crate::ControllerParameters {
@@ -221,8 +221,8 @@ mod tests {
     // Cross check symbolic pole placement formula against explicit values
     fn pole_placement_formula_matches() {
         let test_vals = [
-            (TestParams{L: 0.00184, R: 0.66}, ExpectedPI{kp: 11.5813, ki: 5.1050e4}),
-            (TestParams{L: 0.00084, R: 0.3}, ExpectedPI{kp: 5.2883, ki: 2.3305e4}),
+            (TestParams{L: 0.00184, R: 0.66}, ExpectedPI{kp: 0.7959, ki: 611.3735}),
+            (TestParams{L: 0.00084, R: 0.3}, ExpectedPI{kp: 0.3646, ki: 279.0945}),
         ];
 
         for test_cfg in test_vals {

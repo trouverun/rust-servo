@@ -18,7 +18,7 @@ pub use crate::pi_control::{PIController, compute_current_pi_controller_gains};
 pub use crate::estimation::{
     ConstantMotorParameters, HallCalibrator, OfflineMotorEstimator, OfflineEstimatorInput,
     OfflineEstimatorCommand, OfflineEstimatorOutput, OfflineEstimatorConfig,
-    MotorParams, MotorParamsEstimate, MotorParamEstimator
+    MotorParams, MotorParamsEstimate, MotorParamEstimator, EstimationStepFault
 };
 #[cfg(test)]
 pub use crate::sim::*;
@@ -26,7 +26,7 @@ pub use crate::sim::*;
 pub use crate::test_utils::*;
 
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, defmt::Format)]
 pub struct ControllerParameters {
     pub d_pi: PIGains,
     pub q_pi: PIGains
@@ -46,7 +46,7 @@ impl FOC {
         let sampling_time_s = 1.0 / pwm_freq_hz;
 
         // Slow I controller for calibration steady-state use:
-        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 1.0, kt: 0.5 };
+        let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 1.0, kt: 1.0 };
         let calibration_d_pi = PIController::new(calibration_gains, sampling_time_s);
         let calibration_q_pi = PIController::new(calibration_gains, sampling_time_s);
 
@@ -238,11 +238,11 @@ mod tests {
                 sim: state,
             });
 
-            if time_s < 0.001 {
+            if time_s < 0.01 {
                 // Overshoot <= 5%
                 assert!(state.i_q <= 1.05*iq_setpoint, "Step response overshoot threshold exceeded")
             } else {
-                // Settling time (to within 2%) <= 1ms
+                // Settling time (to within 2%) <= 10ms
                 assert!(
                     0.98*iq_setpoint <= state.i_q && state.i_q <= 1.02*iq_setpoint,
                     "Step response settling time exceeded"

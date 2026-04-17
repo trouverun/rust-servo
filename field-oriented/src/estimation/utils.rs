@@ -1,3 +1,5 @@
+use crate::estimation::EstimationStepFault;
+
 /// Accumulator for solving y = a*x via least-squares: a = sum(x*y) / sum(x^2)
 pub struct Lse {
     xy_sum: f32,
@@ -25,11 +27,19 @@ impl Lse {
         }
     }
 
-    pub fn solve(&self, min_data: u32) -> Option<f32> {
-        if !self.overflow && self.num_data > min_data && self.xx_sum > 1e-12 {
-            Some(self.xy_sum / self.xx_sum)
+    pub fn solve(&self, min_data: u32) -> Result<f32, EstimationStepFault> {
+        if self.overflow {
+            return Err(EstimationStepFault::Overflow)
+        }
+
+        if self.num_data < min_data {
+            return Err(EstimationStepFault::InsufficientSamples);
+        }
+
+        if self.xx_sum > 1e-12 {
+            Ok(self.xy_sum / self.xx_sum)
         } else {
-            None
+            Err(EstimationStepFault::DegenSolution)
         }
     }
 }
