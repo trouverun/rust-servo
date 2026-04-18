@@ -1,28 +1,35 @@
 
 use core::f32::consts::{PI, TAU};
 use num_traits::Float;
-
-use embassy_stm32::{flash::{Blocking as BlockingFlash, Flash}, peripherals::CORDIC, timer::{low_level::FilterValue, pwm::{PWM, Running as PwmRunning}, trigger_output::BasicTrgoOutput}};
-use embassy_stm32::{Config as RccConfig};
-use embassy_stm32::rcc::*;
 use embassy_stm32::adc::{
-    ExternalTriggeredADC, EocInterruptEnabled, JeosInterruptEnabled, 
-    Running as AdcRunning, Queued, AnyAdcChannel, AdcConfig, SampleTime, StartMode,
-    Adc, Exten, Dual, Adc345InjectedTrigger
+    Adc, AdcConfig, AnyAdcChannel, Dual, EocInterruptEnabled, ExternalTriggeredADC, Exten,
+    JeosInterruptEnabled, Queued, Running as AdcRunning, SampleTime, StartMode,
 };
-use embassy_stm32::cordic::{Cordic, Precision, NoScale, SqrtScale, Sin, Sqrt, Q15};
-use embassy_stm32::pac::timer::{vals::{Bkp}};
-use embassy_stm32::timer::hall::{HallSensor};
 use embassy_stm32::cordic::utils::{f32_to_q1_15, q1_15_to_f32};
-use field_oriented::{ControllerParameters, HasRotorFeedback, MotorParamsEstimate, RotorFeedbackFault};
-use crate::{boards::*, types::FirmwareConfig};
-use field_oriented::{DoesFocMath, RotorFeedback, SinCosResult, PhaseValues};
+use embassy_stm32::cordic::{Cordic, NoScale, Precision, Q15, Sin, Sqrt, SqrtScale};
+use embassy_stm32::flash::{Blocking as BlockingFlash, Flash};
+use embassy_stm32::pac::timer::vals::Bkp;
+use embassy_stm32::peripherals::CORDIC;
+use embassy_stm32::rcc::*;
+use embassy_stm32::timer::hall::HallSensor;
+use embassy_stm32::timer::low_level::FilterValue;
+use embassy_stm32::timer::pwm::{Running as PwmRunning, PWM};
+use embassy_stm32::timer::trigger_output::BasicTrgoOutput;
+use embassy_stm32::timer::Channel;
+use embassy_stm32::Config as RccConfig;
+use field_oriented::{
+    ControllerParameters, DoesFocMath, HasRotorFeedback, MotorParamsEstimate, PhaseValues,
+    RotorFeedback, RotorFeedbackFault, SinCosResult,
+};
+use crate::boards::*;
+use crate::utils::{iir_cutoff_to_alpha};
+use crate::types::FirmwareConfig;
 
 const ADC_VOLTAGE: f32 = 3.3;
 const OPAMP_GAIN_RECIPROCAL: f32 = 1.0 / BOARD.opamp_gain;
 const SHUNT_CONDUCTANCE_SIEMENS: f32 = 1000.0 / BOARD.shunt_resistance_mohm;
-const ADC_SCALER: f32 = ((1 << 12) - 1) as f32 * ADC_VOLTAGE;
-const CURRENT_READING_SCALER: f32 = 0.5 * ADC_SCALER * OPAMP_GAIN_RECIPROCAL * SHUNT_CONDUCTANCE_SIEMENS;
+const ADC_SCALER: f32 = ADC_VOLTAGE / ((1 << 12) - 1) as f32;
+const CURRENT_READING_SCALER: f32 = -ADC_SCALER * OPAMP_GAIN_RECIPROCAL * SHUNT_CONDUCTANCE_SIEMENS;
 const VBUS_READING_SCLAER: f32 = ADC_SCALER * BOARD.vbus_divide_factor;
 const TBOARD_READING_SCLAER: f32 = ADC_SCALER * BOARD.thermistor_scaling.slope;
 
@@ -87,7 +94,7 @@ impl AdcFeedback {
                 (vbus_channel.get_hw_channel(), SampleTime::CYCLES6_5),
                 (u_channel.get_hw_channel(), SampleTime::CYCLES6_5),
                 (v_channel.get_hw_channel(), SampleTime::CYCLES6_5)])
-            .start(EocInterruptEnabled::DISABLED, JeosInterruptEnabled::ENABLED, StartMode::EMPTY);
+            .start(EocInterruptEnabled::ENABLED, JeosInterruptEnabled::ENABLED, StartMode::EMPTY);
 
         let mut adc_b_config = AdcConfig::default();
         adc_b_config.resolution = Some(embassy_stm32::adc::Resolution::BITS12);
@@ -102,7 +109,7 @@ impl AdcFeedback {
                 (vbus_channel.get_hw_channel(), SampleTime::CYCLES6_5),
                 (v_channel.get_hw_channel(), SampleTime::CYCLES6_5),
                 (w_channel.get_hw_channel(), SampleTime::CYCLES6_5)])
-            .start(EocInterruptEnabled::DISABLED, JeosInterruptEnabled::ENABLED, StartMode::EMPTY);
+            .start(EocInterruptEnabled::DISABLED, JeosInterruptEnabled::DISABLED, StartMode::EMPTY);
 
         Self {
             _opamps: opamps,
@@ -175,11 +182,11 @@ impl AdcFeedback {
             let amps_c = -(amps_a + amps_b);
             match self.sampled_sector {
                 // 1 0 0, sampled VW:
-                0 => return Some(PhaseValues{u: amps_c, v: amps_a, w: amps_b}), 
+                0 => return Some(PhaseValues{u: amps_c, v: amps_a, w: amps_b}),
                 // 1 1 0, sampled UW
-                1 => return Some(PhaseValues{u: amps_a, v: amps_b, w: amps_c}),
-                // 0 1 0, sampled UW 
-                2 => return Some(PhaseValues{u: amps_a, v: amps_b, w: amps_c}),
+                1 => return Some(PhaseValues{u: amps_a, v: amps_c, w: amps_b}),
+                // 0 1 0, sampled UW
+                2 => return Some(PhaseValues{u: amps_a, v: amps_c, w: amps_b}),
                 // 0 1 1, sampled UV
                 3 => return Some(PhaseValues{u: amps_a, v: amps_b, w: amps_c}),
                 // 0 0 1, sampled UV
@@ -194,7 +201,7 @@ impl AdcFeedback {
     }
 
     pub fn sample_sector(&mut self, sector: u8) {
-        let (source_a, source_b) = match self.sampled_sector {
+        let (source_a, source_b) = match sector {
             // 1 0 0, sampled VW:
             0 => (self.v_channel.get_hw_channel(), self.w_channel.get_hw_channel()), 
             // 1 1 0, sampled UW
@@ -225,6 +232,36 @@ impl AdcFeedback {
     }
 }
 
+enum HallInterpolationState {
+    Stationary,
+    DirectionChange,
+    Normal
+}
+
+impl HallInterpolationState {
+    pub fn step(&mut self, prev_pattern: u8, pattern: u8, prev_dir: i8, dir: i8) {
+        match self {
+            HallInterpolationState::Stationary => {
+                if prev_dir != dir {
+                    *self = HallInterpolationState::DirectionChange;
+                }
+            }
+            HallInterpolationState::DirectionChange => {
+                if prev_pattern != pattern {
+                    if prev_dir == dir {
+                        *self = HallInterpolationState::Normal;
+                    }
+                }
+            }
+            HallInterpolationState::Normal => {
+                if prev_dir != dir {
+                    *self = HallInterpolationState::DirectionChange;
+                }
+            }
+        };
+    }
+}
+
 #[cfg(feature = "hall-feedback")]
 pub struct HallFeedback {
     pub sensor: HallSensor<'static, HallFeedbackTimer>,
@@ -235,31 +272,22 @@ pub struct HallFeedback {
     /// Forward hall sequence: sector_span[pattern] leads to forward_next[pattern].
     /// Used to determine rotation direction from pattern transitions.
     forward_next: Option<[u8; 6]>,
-    filtered_velocity: f32,
-    prev_raw_velocity: f32,
+    prev_pattern: u8,
+    prev_dir: i8,
+    state: HallInterpolationState
 }
 
 #[cfg(feature = "hall-feedback")]
 impl HallFeedback {
-    const LOWPASS_CUTOFF_HZ: f32 = 1_000.0;
-    const LOWPASS_ALPHA: f32 = {
-        let x = -TAU * Self::LOWPASS_CUTOFF_HZ / PWM_FREQ.0 as f32;
-        // Pade approximation of exp(x) (f32::exp() is not const fn):
-        let x2 = x * x;
-        let x3 = x2 * x;
-        let num = 1.0 + x / 2.0 + x2 / 10.0 + x3 / 120.0;
-        let den = 1.0 - x / 2.0 + x2 / 10.0 - x3 / 120.0;
-        num / den
-    };
-
     pub fn new(mappings: HallFeedbackMappings) -> Self {
         Self {
             sensor: mappings.sensor,
             hall_pattern_to_theta: None,
             sector_span: None,
             forward_next: None,
-            filtered_velocity: 0.0,
-            prev_raw_velocity: 0.0,
+            prev_pattern: 0,
+            prev_dir: 0,
+            state: HallInterpolationState::Stationary
         }
     }
 
@@ -327,6 +355,8 @@ impl HallFeedback {
 impl HasRotorFeedback for HallFeedback {
     fn read(&mut self) -> Result<RotorFeedback, RotorFeedbackFault> {
         // Todo: return Result so caller can deal with invalid patterns 000 and 111
+
+        // Return fault if this has not been calibrated yet:
         let hall_pattern_to_theta = self.hall_pattern_to_theta.ok_or(RotorFeedbackFault::NotCalibrated)?;
         let forward_next = self.forward_next.ok_or(RotorFeedbackFault::NotCalibrated)?;
         let sector_span = self.sector_span.ok_or(RotorFeedbackFault::NotCalibrated)?;
@@ -334,22 +364,44 @@ impl HasRotorFeedback for HallFeedback {
         let raw_state = self.sensor.read_state();
         let idx = (raw_state.pattern.wrapping_sub(1) as usize).min(5);
         let dir = self.direction(forward_next, raw_state.prev_pattern, raw_state.pattern);
-        let span = sector_span[idx];
 
         // Size of the current Hall sector in electrical angle radians:
-        let signed_span = dir as f32 * span;
+        let signed_span = sector_span[idx] * dir as f32;
         // Fraction of current sector elapsed (dimensionless: counter/period, ticks cancel)
-        let fraction = raw_state.counter as f32 * raw_state.hall_period_reciprocal_cycles;
+        let fraction = raw_state.extended_counter as f32 * raw_state.hall_period_reciprocal_count;
 
-        let angle = hall_pattern_to_theta[idx] + signed_span * fraction;
-        let raw_velocity = signed_span * raw_state.hall_period_reciprocal_cycles * self.sensor.timer_frequency_reciprocal_s;
+        self.state.step(self.prev_pattern, raw_state.pattern, self.prev_dir, dir);
+        let (theta, omega) = match self.state {
+            HallInterpolationState::Stationary => {
+                // Best standstill guess, midpoint of the current sector:
+                let theta = hall_pattern_to_theta[idx] + 0.5*signed_span;
+                let omega = 0.0;
+                (theta, omega)
+            }
+            HallInterpolationState::DirectionChange => {
+                // Continuous rotation in one direction not yet proven, so:
+                // - allow interpolation up to the midpoint of the current sector (prevent being off by a full sector, if oscillating around same edge)
+                // - set omega to zero, to avoid huge values from oscillating around same edge rapidly
+                let theta = hall_pattern_to_theta[idx] + signed_span * fraction.clamp(0.0, 0.5);
+                let omega = 0.0;
+                (theta, omega)
+            }
+            HallInterpolationState::Normal => {
+                // Interpolate up to the next Hall edge angle:
+                let theta = hall_pattern_to_theta[idx] + signed_span * fraction.clamp(0.0, 1.0);
+                let mut omega = signed_span * raw_state.hall_period_reciprocal_count * self.sensor.get_tick_frequency_hz();
+                if fraction > 1.0 {
+                    // If active count exceeds the period used to estimate velocity,
+                    // it means omega is overestimated, divide by factor to taper it down:
+                    omega /= fraction;
+                }
+                (theta, omega)
+            }
+        };
+        self.prev_pattern = raw_state.pattern;
+        self.prev_dir = dir;
 
-        // IIR low-pass: y[n] = alpha*y[n-1] + (1-alpha)*x[n-1]
-        let alpha = Self::LOWPASS_ALPHA;
-        self.filtered_velocity = alpha * self.filtered_velocity + (1.0 - alpha) * self.prev_raw_velocity;
-        self.prev_raw_velocity = raw_velocity;
-
-        Ok(RotorFeedback { theta: angle, omega: self.filtered_velocity })
+        Ok(RotorFeedback { theta, omega })
     }
 }
 
@@ -367,8 +419,9 @@ impl PwmOutput {
 
         #[cfg(feature = "overcurrent-comparators")]
         {
-            mappings.comparators.dac_single.set_voltage(0.2);
-            mappings.comparators.dac_dual.set_voltage(0.2, 0.2);
+            // Todo: make configurable:
+            mappings.comparators.dac_single.set_voltage(0.4);
+            mappings.comparators.dac_dual.set_voltage(0.4, 0.4);
             tmp = tmp
                 .with_break1_comp(&mappings.comparators.comp_u, Bkp::ACTIVE_HIGH, FilterValue::FCK_INT_N4)
                 .with_break1_comp(&mappings.comparators.comp_v, Bkp::ACTIVE_HIGH, FilterValue::FCK_INT_N4)
@@ -392,7 +445,18 @@ impl PwmOutput {
     }
 
     pub fn set_duty_cycles(&self, duty_cycles: PhaseValues) {
-        
+        let arv = self.pwm.get_autoreload_value() as f32;
+        self.pwm.set_compare_value(Channel::Ch1, (duty_cycles.u*arv).clamp(0.0, u16::MAX as f32) as u16);
+        self.pwm.set_compare_value(Channel::Ch2, (duty_cycles.v*arv).clamp(0.0, u16::MAX as f32) as u16);
+        self.pwm.set_compare_value(Channel::Ch3, (duty_cycles.w*arv).clamp(0.0, u16::MAX as f32) as u16);
+    }
+
+    pub fn check_break1(&self) -> bool {
+        self.pwm.acknowledge_break1()
+    }
+
+    pub fn check_break2(&self) -> bool {
+        self.pwm.acknowledge_break2()
     }
 }
 
