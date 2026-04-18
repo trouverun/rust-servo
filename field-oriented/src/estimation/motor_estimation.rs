@@ -289,7 +289,7 @@ impl OfflineMotorEstimator {
             OfflineEstimatorState::RampDown { ran_s, latched_i_q, ramp_duation_s, .. } => {
                 let ramp = (1.0 - ran_s / (*ramp_duation_s + 1e-5)).clamp(0.0, 1.0);
                 let i_q = if let Some(val) = latched_i_q {
-                    ramp * *val
+                    ramp * (*val)
                 } else {
                     ramp * input.target_current
                 };
@@ -321,7 +321,7 @@ impl OfflineMotorEstimator {
         matches!(self.state, OfflineEstimatorState::TuningRequired { .. })
     }
 
-    pub fn fault(&self) -> Option<EstimationStepFault> {
+    pub fn get_fault(&self) -> Option<EstimationStepFault> {
         match self.state {
             OfflineEstimatorState::Failure { fault } => Some(fault),
             _ => None
@@ -443,8 +443,7 @@ mod test {
 
             if estimator.should_reset_controller() {
                 foc.reset();
-            }
-            if estimator.should_tune_controller() {
+            }else if estimator.should_tune_controller() {
                 let pi_gains = compute_current_pi_controller_gains::<50>(
                     estimator.get_estimate(), pwm_freq_hz
                 ).expect("Failed to tune PI controller");

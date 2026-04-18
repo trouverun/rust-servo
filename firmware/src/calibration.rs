@@ -1,11 +1,12 @@
 use crate::{boards::PWM_FREQ};
 use field_oriented::{
     ClarkParkValue, MotorParamsEstimate, MotorParamEstimator, HallCalibrator, OfflineMotorEstimator,
-    OfflineEstimatorConfig, FocInputType, ControllerParameters, OfflineEstimatorOutput, 
-    OfflineEstimatorInput, compute_current_pi_controller_gains
+    OfflineEstimatorConfig, FocInputType, OfflineEstimatorOutput, 
+    OfflineEstimatorInput, EstimationStepFault
 };
 
 pub struct CalibrationInputs {
+    pub dc_bus_voltage: f32,
     pub theta: f32,
     pub hall_pattern: u8,
     pub num_pole_pairs: Option<u8>,
@@ -20,10 +21,10 @@ pub struct CalibrationOutput {
     pub foc_command: FocInputType,
 }
 
+#[derive(defmt::Format)]
 pub enum FailureCause {
     MissingParameter,
-    MotorParameterEstimation,
-    PiTuning
+    MotorParameterEstimation { fault: EstimationStepFault },
 }
 
 /// Stage specific outputs / results
@@ -31,13 +32,10 @@ pub enum StageResult {
     HallCalibration {
         angle_table: [f32; 6]
     },
+    ResetRequest,
+    TuningRequest,
     MotorParameters {
         motor_params: MotorParamsEstimate
-    },
-    /// Separate stage with idle outputs,
-    /// so the PI tuning can safely consume multiple FOC iterations
-    Tuning {
-        pi_gains: ControllerParameters,
     },
     Failure {
         cause: FailureCause
@@ -47,7 +45,6 @@ pub enum StageResult {
 enum CalibrationPhase {
     HallCalibration,
     MotorEstimation,
-    Tuning,
     Done,
 }
 
@@ -59,11 +56,13 @@ pub struct CalibrationRunner {
 
 impl CalibrationRunner {
     pub fn new() -> Self {
-        let hall_calibrator = HallCalibrator::new(1.0, 0.01);
+        let hall_calibrator = HallCalibrator::new(3.0);
         let cfg = OfflineEstimatorConfig {
             dt: 1.0 / PWM_FREQ.0 as f32,
-            settle_time_s: 1.0,
-            test_time_s: 1.0
+            settle_time_s: 3.0,
+            test_time_s: 5.0,
+            max_spin_time_s: 15.0,
+            min_spin_omega: 100.0
         };
         let motor_estimator = OfflineMotorEstimator::new(cfg);
         Self {
@@ -100,48 +99,42 @@ impl CalibrationRunner {
                     }
                 } else {
                     const PWM_FREQ_HZ : u32 = PWM_FREQ.0;
-                    let angle = self.hall_calibrator.calibration_step::<PWM_FREQ_HZ>(
+                    let theta = self.hall_calibrator.calibration_step::<PWM_FREQ_HZ>(
                         inputs.hall_pattern, inputs.target_omega
                     );
                     let output = CalibrationOutput {
-                        theta: angle,
-                        foc_command: FocInputType::TargetCurrents(ClarkParkValue {
+                        theta,
+                        foc_command: FocInputType::CalibrationCurrents(ClarkParkValue {
                             d: inputs.target_current, q: 0.0
-                        })
+                        }),
                     };
                     (output, None)
                 }
             }
             CalibrationPhase::MotorEstimation => {
-                if self.motor_estimator.estimation_done() {
-                    self.phase = CalibrationPhase::Tuning;
+                if self.motor_estimator.should_reset_controller() {
+                    let output = self.idle_output(inputs);
+                    (output, Some(StageResult::ResetRequest))
+                } else if self.motor_estimator.should_tune_controller() {
+                    let output = self.idle_output(inputs);
+                    (output, Some(StageResult::TuningRequest))
+                } else if self.motor_estimator.estimation_done() {
+                    self.phase = CalibrationPhase::Done;
                     let output = self.idle_output(inputs);
                     let result = Some(StageResult::MotorParameters { 
                         motor_params: self.motor_estimator.get_estimate()
                     });
                     (output, result)
-                } else if self.motor_estimator.estimation_failed() {
+                } else if let Some(fault) = self.motor_estimator.get_fault() {
                     self.phase = CalibrationPhase::Done;
                     let output = self.idle_output(inputs);
-                    (output, Some(StageResult::Failure { cause: FailureCause::MotorParameterEstimation }))
+                    (output, Some(StageResult::Failure { 
+                        cause: FailureCause::MotorParameterEstimation { fault }
+                    }))
                 } else {
                     let output = self.motor_estimation_output(inputs);
                     (output, None)
                 }
-            }
-            CalibrationPhase::Tuning => {
-                self.phase = CalibrationPhase::Done;
-                let output = self.idle_output(inputs);
-                if let Some(motor_params) = self.motor_estimator.get_estimate().to_params() {
-                    let pi_gains_opt = compute_current_pi_controller_gains::<50>(
-                        motor_params, PWM_FREQ.0 as f32
-                    );
-                    if let Some(pi_gains) = pi_gains_opt {
-                        let result = StageResult::Tuning { pi_gains };
-                        return (output, Some(result))
-                    }
-                }
-                (output, Some(StageResult::Failure { cause: FailureCause::PiTuning }))
             }
             CalibrationPhase::Done => {
                 let output = self.idle_output(inputs);
@@ -152,14 +145,16 @@ impl CalibrationRunner {
     
     fn motor_estimation_output(&mut self, inputs: CalibrationInputs) -> CalibrationOutput {
         let step_input = OfflineEstimatorInput {
+            dc_bus_voltage: inputs.dc_bus_voltage,
             target_voltage: inputs.target_voltage,
             target_current: inputs.target_current,
             theta: inputs.theta
         };
-        let estimator_command = self.motor_estimator.step(step_input);
+        let estimator_command = self.motor_estimator.get_command(step_input);
         let foc_command = match estimator_command.output {
-            OfflineEstimatorOutput::Current(i_dq) => FocInputType::TargetCurrents(i_dq),
-            OfflineEstimatorOutput::Voltage(u_dq) => FocInputType::TargetVoltage(u_dq),
+            OfflineEstimatorOutput::CalibrationCurrent(i_dq) => FocInputType::CalibrationCurrents(i_dq),
+            OfflineEstimatorOutput::CalibrationVoltage(u_dq) => FocInputType::CalibrationVoltage(u_dq),
+            OfflineEstimatorOutput::Current(i_dq) => FocInputType::TargetCurrents(i_dq)
         };
         CalibrationOutput {
             theta: estimator_command.theta,
@@ -170,7 +165,7 @@ impl CalibrationRunner {
     fn idle_output(&self, inputs: CalibrationInputs) -> CalibrationOutput {
         CalibrationOutput {
             theta: inputs.theta,
-            foc_command: FocInputType::TargetVoltage(ClarkParkValue { d: 0.0, q: 0.0 }),
+            foc_command: FocInputType::CalibrationVoltage(ClarkParkValue { d: 0.0, q: 0.0 }),
         }
     }
 

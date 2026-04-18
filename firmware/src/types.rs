@@ -2,14 +2,18 @@ pub enum Command {
     Idle,
     StartCalibration,
     FinishCalibration,
+    StartTuning,
+    FinishTuning,
     EnableTorqueControl,
-    EnableVelocityControl
+    EnableVelocityControl,
+    Fault,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, defmt::Format)]
 pub enum OperatingMode {
     Idle,
     Calibration,
+    Tuning,
     TorqueControl,
     VelocityControl,
     Fault
@@ -18,9 +22,12 @@ pub enum OperatingMode {
 impl OperatingMode {
     pub fn on_command(&self, command: Command) -> Self {
         match (self, command) {
+            (_, Command::Fault) => OperatingMode::Fault,
             (OperatingMode::Idle, Command::StartCalibration) => OperatingMode::Calibration,
             (OperatingMode::Idle, Command::EnableTorqueControl) => OperatingMode::TorqueControl,
+            (OperatingMode::Calibration, Command::StartTuning) => OperatingMode::Tuning,
             (OperatingMode::Calibration, Command::FinishCalibration) => OperatingMode::Idle,
+            (OperatingMode::Tuning, Command::FinishTuning) => OperatingMode::Calibration,
             (OperatingMode::TorqueControl, Command::Idle) => OperatingMode::Idle,
             (_, _) => *self
         }
@@ -53,7 +60,7 @@ impl ButtonState {
 }
 
 pub struct BoardStatus {
-    pub dc_bus_voltage: f32,
+    pub dc_bus_voltage: Option<f32>,
     pub temperature: f32,
 }
 
@@ -61,14 +68,16 @@ pub struct FirmwareConfig {
     pub calibration_voltage: f32,
     pub calibration_current: f32,
     pub calibration_omega: f32,
+    pub current_limit: f32,
 }
 
 impl Default for FirmwareConfig {
     fn default() -> Self {
         Self {
-            calibration_voltage: 6.0,
-            calibration_current: 0.33,
-            calibration_omega: 33.0,
+            calibration_voltage: 18.0,
+            calibration_current: 2.0,
+            calibration_omega: 1.0,
+            current_limit: 0.0
         }
     }
 }

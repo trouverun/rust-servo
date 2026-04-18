@@ -6,7 +6,8 @@ use embassy_stm32::peripherals::{
     TIM3, TIM8,
     COMP4, COMP6, COMP7,
     DAC1, DAC4,
-    ADC1, TIM6, PD15, TIM2
+    ADC1, TIM6, TIM2,
+    TIM1,
 };
 use embassy_stm32::opamp::{OpAmp, OpAmpSpeed};
 use embassy_stm32::adc::{
@@ -86,7 +87,7 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
         w_channel: AdcChannel::<FeedbackAdcB>::degrade_adc(p.PD14),
         vbus_channel: AdcChannel::<FeedbackAdcA>::degrade_adc(p.PB13),
         tboard_channel: AdcChannel::<FeedbackAdcB>::degrade_adc(p.PE15),
-        sample_trigger: BasicTrgoOutput::new(p.TIM6, Hertz(100)),
+        sample_trigger: BasicTrgoOutput::new(p.TIM6, Hertz(1)),
     };
 
     let hall_feedback = super::HallFeedbackMappings {
@@ -109,7 +110,11 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
                 .with_ch2(p.PC7).with_ch2n(p.PC11)
                 .with_ch3(p.PC8).with_ch3n(p.PC12)
                 .with_break2_pin(p.PD1, Bkinp::INVERTED, Bkp::ACTIVE_HIGH, FilterValue::FCK_INT_N4),
-        deadtime: PwmDeadtime::Nanosecods(200)
+        /*pwm: PWM::new(p.TIM1, super::PWM_FREQ, super::COUNTING_MODE)
+                .with_ch1(p.PE9).with_ch1n(p.PE8)
+                .with_ch2(p.PE11).with_ch2n(p.PE10)
+                .with_ch3(p.PE13).with_ch3n(p.PB9),*/
+        deadtime: PwmDeadtime::Nanosecods(300)
     };
 
     let acceleration = super::AccelerationMappings {

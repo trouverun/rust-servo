@@ -18,7 +18,7 @@ mod zest1;
 #[cfg(feature = "board-zest1")]
 pub use zest1::*;
 
-pub const PWM_FREQ: Hertz = Hertz(15_000);
+pub const PWM_FREQ: Hertz = Hertz(20_000);
 pub const COUNTING_MODE: CountingMode = CountingMode::CenterAlignedBothInterrupts;
 
 pub struct TherimistorLinearScale {
