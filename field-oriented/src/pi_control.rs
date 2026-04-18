@@ -1,4 +1,4 @@
-use crate::MotorParams;
+use crate::{MotorParams, MotorParamsEstimate};
 use libm::{cosf, expf, powf, sinf};
 use num_complex::{Complex32};
 
@@ -62,15 +62,17 @@ impl PIController {
 
     pub fn reset(&mut self) {
         self.integral_term = 0.0;
+        self.prev_reference = 0.0;
+        self.prev_rf = 0.0;
     }
 }
 
 // PI autotuning based on step response requirements using pole-placement 
 pub fn compute_current_pi_controller_gains<const N: usize>(
-    params: MotorParams, pwm_freq_hz: f32
+    params: MotorParamsEstimate, pwm_freq_hz: f32
 ) -> Option<crate::ControllerParameters> {
-    let R = params.stator_resistance;
-    let L = params.q_inductance;
+    let R = params.stator_resistance?;
+    let L = params.q_inductance?;
     let T = 1.0 / pwm_freq_hz;
 
     if R <= 0.0 || L <= 0.0 || T <= 0.0 {
@@ -97,7 +99,9 @@ pub fn compute_current_pi_controller_gains<const N: usize>(
     // (assume additional 10% in estimation error)
     let L_perturb = [0.8, 0.9, 1.0, 1.1];
     
-    if small_gain_stability_check::<N>(params, &gains, pwm_freq_hz, &R_perturb, &L_perturb) {
+    if small_gain_stability_check::<N>(
+        R, L, &gains, pwm_freq_hz, &R_perturb, &L_perturb
+    ) {
         Some(gains)
     } else {
         None
@@ -115,9 +119,7 @@ struct PolyTerms {
 }
 
 /// Collect the polynomial coefficients for the transfer function T(z) = (C(z)P(z)) / (1 + C(z)P(z))
-fn polyterm_T(params: MotorParams, gains: &crate::ControllerParameters, pwm_freq_hz: f32) -> PolyTerms {
-    let R = params.stator_resistance;
-    let L = params.q_inductance;
+fn polyterm_T(R: f32, L: f32, gains: &crate::ControllerParameters, pwm_freq_hz: f32) -> PolyTerms {
     let T = 1.0 / pwm_freq_hz;
     let kp = gains.q_pi.kp;
     let ki = gains.q_pi.ki;
@@ -133,9 +135,7 @@ fn polyterm_T(params: MotorParams, gains: &crate::ControllerParameters, pwm_freq
 }
 
 /// Collect the polynomial coefficients for the transfer function Delta(z) = (P_perturbed(z) - P(z)) / P(z)
-fn polyterm_delta(params: MotorParams, Rp: f32, Lp: f32, pwm_freq_hz: f32) -> PolyTerms {
-    let R = params.stator_resistance;
-    let L = params.q_inductance;
+fn polyterm_delta(R: f32, L: f32, Rp: f32, Lp: f32, pwm_freq_hz: f32) -> PolyTerms {
     let T = 1.0 / pwm_freq_hz;
     let C1 = expf(Rp*T/Lp);
     let C2 = expf(R*T/L);
@@ -160,11 +160,9 @@ fn eval_mag(polyterms: &PolyTerms, z: Complex32) -> f32 {
 /// Robust stability check using a grid search over parameter variations and frequencies,
 /// checking the small-gain theorem for all of them
 fn small_gain_stability_check<const N: usize>(
-    params: MotorParams, gains: &crate::ControllerParameters, pwm_freq_hz: f32,
+    R: f32, L: f32, gains: &crate::ControllerParameters, pwm_freq_hz: f32,
     R_perturb: &[f32], L_perturb: &[f32]
 ) -> bool {
-    let R = params.stator_resistance;
-    let L = params.q_inductance;
     let T = 1.0 / pwm_freq_hz;
 
     let mut z_vals = [Complex32::new(0.0, 0.0); N];
@@ -175,7 +173,7 @@ fn small_gain_stability_check<const N: usize>(
     let mut omega = 1.0;
 
     // Compute the gain |T(z)|:
-    let t_polyterms = polyterm_T(params, gains, pwm_freq_hz);
+    let t_polyterms = polyterm_T(R, L, gains, pwm_freq_hz);
     for idx in 0..t_vals.len() {
         z_vals[idx] = Complex32::new(cosf(omega*T), sinf(omega*T));
         let gain_recip = 1.0 / eval_mag(&t_polyterms, z_vals[idx]);
@@ -191,7 +189,7 @@ fn small_gain_stability_check<const N: usize>(
             for idx in 0..z_vals.len() {
                 let Rp = R_scaler * R;
                 let Lp = L_scaler * L;
-                let delta_polyterms = polyterm_delta(params, Rp, Lp, pwm_freq_hz);
+                let delta_polyterms = polyterm_delta(R, L, Rp, Lp, pwm_freq_hz);
                 let mag = eval_mag(&delta_polyterms, z_vals[idx]);
                 if mag >= t_vals[idx] {
                     return false
@@ -226,13 +224,13 @@ mod tests {
         ];
 
         for test_cfg in test_vals {
-            let params = MotorParams {
+            let params = MotorParamsEstimate::from_nominal(MotorParams {
                 num_pole_pairs: 0,
                 stator_resistance: test_cfg.0.R,
                 d_inductance: test_cfg.0.L,
                 q_inductance: test_cfg.0.L,
                 pm_flux_linkage: 0.0
-            };
+            });
 
             if let Some(gains) = compute_current_pi_controller_gains::<50>(params, 20_000.0) {
                 assert!(
@@ -258,15 +256,17 @@ mod tests {
     // Cross check the symbolic transfer function of T(z) and Delta(z) against explicit values
     fn small_gain_frequency_response_matches() {
         // Test params:
-        let motor_params = MotorParams {
+        let motor_params = MotorParamsEstimate::from_nominal(MotorParams {
             num_pole_pairs: 0,
             stator_resistance: 0.66,
             d_inductance: 0.00184,
             q_inductance: 0.00184,
             pm_flux_linkage: 0.0
-        };
-        let Rp = motor_params.stator_resistance*1.4;
-        let Lp = motor_params.d_inductance*0.5;
+        });
+        let R = motor_params.stator_resistance.unwrap();
+        let L = motor_params.d_inductance.unwrap();
+        let Rp = 1.4*R;
+        let Lp = 0.5*L;
         let gains = PIGains {
             kr: 0.0,
             kp: 11.5813,
@@ -285,7 +285,7 @@ mod tests {
             ExpectedGain {omega: 4.9721e03, mag: 1.3218},
             ExpectedGain {omega: 3.0000e+04, mag: 0.3124},
         ];
-        let term_T = polyterm_T(motor_params, &controller_params, pwm_freq_hz);
+        let term_T = polyterm_T(R, L, &controller_params, pwm_freq_hz);
         for expected in T_expected {
             let z = Complex32::new(cosf(expected.omega*T), sinf(expected.omega*T));
             let mag = eval_mag(&term_T, z);
@@ -302,7 +302,7 @@ mod tests {
             ExpectedGain {omega: 4.9721e03, mag: 0.9817},
             ExpectedGain {omega: 3.0000e+04, mag: 0.9993},
         ];
-        let term_delta = polyterm_delta(motor_params, Rp, Lp, pwm_freq_hz);
+        let term_delta = polyterm_delta(R, L, Rp, Lp, pwm_freq_hz);
         for expected in delta_expected {
             let z = Complex32::new(cosf(expected.omega*T), sinf(expected.omega*T));
             let mag = eval_mag(&term_delta, z);
@@ -324,6 +324,8 @@ mod tests {
             q_inductance: 0.00184,
             pm_flux_linkage: 0.0
         };
+        let R = motor_params.stator_resistance;
+        let L = motor_params.q_inductance;
         let gains = PIGains {
             kr: 0.0,
             kp: 11.5813,
@@ -334,7 +336,7 @@ mod tests {
         let controller_params = ControllerParameters {
             d_pi: gains, q_pi: gains
         };
-        let stable = small_gain_stability_check::<50>(motor_params, &controller_params, pwm_freq_hz, &[1.0], &[1.0]);
+        let stable = small_gain_stability_check::<50>(R, L, &controller_params, pwm_freq_hz, &[1.0], &[1.0]);
         assert_eq!(stable, true, "False positive unstable result")
     }
 
@@ -348,6 +350,8 @@ mod tests {
             q_inductance: 0.00184,
             pm_flux_linkage: 0.0
         };
+        let R = motor_params.stator_resistance;
+        let L = motor_params.q_inductance;
         let gains = PIGains {
             kr: 0.0,
             kp: 11.5813,
@@ -358,7 +362,7 @@ mod tests {
         let controller_params = ControllerParameters {
             d_pi: gains, q_pi: gains
         };
-        let stable = small_gain_stability_check::<50>(motor_params, &controller_params, pwm_freq_hz, &[1.4], &[0.5]);
+        let stable = small_gain_stability_check::<50>(R, L, &controller_params, pwm_freq_hz, &[1.4], &[0.5]);
         assert_eq!(stable, false, "Stability violation not detected")
     }
 }

@@ -23,7 +23,7 @@ enum StepResult {
 pub struct OfflineEstimatorConfig {
     pub settle_time_s: f32,
     pub test_time_s: f32,
-    pub spin_time_s: f32,
+    pub max_spin_time_s: f32,
     pub min_spin_omega: f32,
     pub dt: f32,
 }
@@ -35,7 +35,7 @@ enum OfflineEstimatorState {
     /// Steady-state d-axis current: 
     /// R = v_d / i_d (di/dt ≈ 0)
     EstR {
-        waited_s: f32,
+        ran_s: f32,
         /// Solves R from the LSE problem:
         /// v_d = R * i_d
         lse: Lse,
@@ -43,19 +43,21 @@ enum OfflineEstimatorState {
     /// Square wave d-axis voltage, R term cancels over symmetric excitation:
     /// L = |v| / |di/dt|
     EstL {
-        waited_s: f32,
+        ran_s: f32,
         resistance: f32,
         voltage_sign: f32,
-        settle_count: u32,
         prev_i_d: f32,
         /// Solves L from the LSE problem:
         /// |v| = L * |di/dt|
         lse: Lse,
     },
+    /// Need to tune current controller before proceeding
+    TuningRequired { resistance: f32 },
     /// Constant-speed rotation using rotor angle feedback:
     /// pm_flux = (v_q - R*i_q) / omega_e
     EstF {
-        waited_s: f32,
+        ran_s: f32,
+        latched_i_q: Option<f32>,
         resistance: f32,
         /// Solves pm_flux from the LSE problem:
         /// v_q - R*i_q = pm_flux * omega_e
@@ -65,7 +67,9 @@ enum OfflineEstimatorState {
     RampDown {
         pm_flux_linkage: Option<f32>,
         pending_fault: Option<EstimationStepFault>,
-        waited_s: f32
+        ran_s: f32,
+        latched_i_q: Option<f32>,
+        ramp_duation_s: f32
     },
     Failure{fault: EstimationStepFault},
     Done
@@ -87,7 +91,7 @@ impl OfflineEstimatorState {
                 if *waited_s >= config.settle_time_s {
                     let result = Some(StepResult::Transition(
                         Self::EstR {
-                            waited_s: 0.0,
+                            ran_s: 0.0,
                             lse: Lse::new(),
                         }
                     ));
@@ -96,19 +100,18 @@ impl OfflineEstimatorState {
                     Ok(None)
                 }
             }
-            Self::EstR { waited_s, lse } => {
+            Self::EstR { ran_s, lse } => {
                 // v_d = R * i_d
                 lse.accumulate(data.measured_i_dq.d, data.u_dq.d);
-                *waited_s += dt;
-                if *waited_s >= config.test_time_s {
-                    let resistance = lse.solve(100)?;
+                *ran_s += dt;
+                if *ran_s >= config.test_time_s {
+                    let resistance = lse.solve(1000)?;
                     let result = Some(StepResult::EstimateR {
                         resistance,
                         next: Self::EstL {
-                            waited_s: 0.0,
+                            ran_s: 0.0,
                             resistance,
                             voltage_sign: 1.0,
-                            settle_count: 100,
                             prev_i_d: data.measured_i_dq.d,
                             lse: Lse::new(),
                         }
@@ -119,16 +122,8 @@ impl OfflineEstimatorState {
                 }
             }
             Self::EstL {
-                waited_s, resistance, voltage_sign, settle_count, prev_i_d, lse,
+                ran_s, resistance, voltage_sign, prev_i_d, lse,
             } => {
-                // Wait for the current to settle from previous stage:
-                if *settle_count > 0 {
-                    *settle_count -= 1;
-                    *prev_i_d = data.measured_i_dq.d;
-                    *voltage_sign *= -1.0;
-                    return Ok(None);
-                }
-
                 // |v| = L * |di/dt|
                 // use sign(v)*di/dt instead of abs(di/dt) to cancel out noise around low values
                 // (and invert sign(v) since there is a one cycle delay from command to measurement = "wrong" sign)
@@ -138,46 +133,61 @@ impl OfflineEstimatorState {
                 lse.accumulate(x, y);
 
                 *voltage_sign *= -1.0;
-                *waited_s += dt;
-                if *waited_s >= config.test_time_s {
-                    let d_inductance = lse.solve(100)?;
+                *ran_s += dt;
+                if *ran_s >= config.test_time_s {
+                    let d_inductance = lse.solve(1000)?;
                     let result = Some(StepResult::EstimateL {
                         d_inductance,
-                        next: Self::EstF {
-                            waited_s: 0.0,
-                            resistance: *resistance,
-                            lse: Lse::new(),
-                        },
+                        next: Self::TuningRequired { resistance: *resistance },
                     });
                     Ok(result)
                 } else {
                     Ok(None)
                 }
             }
+            Self::TuningRequired { resistance } => {
+                let result = Some(StepResult::Transition(
+                    Self::EstF {
+                        ran_s: 0.0,
+                        latched_i_q: None,
+                        resistance: *resistance,
+                        lse: Lse::new(),
+                    },
+                ));
+                Ok(result)
+            }
             Self::EstF {
-                waited_s, resistance, lse,
+                ran_s, latched_i_q, resistance, lse
             } => {
                 // v_q - R*i_q = pm_flux * omega_e
                 let x = omega_e;
                 let y = data.u_dq.q - *resistance * data.measured_i_dq.q;
-
-                if omega_e.abs() / num_pole_pairs as f32 >= config.min_spin_omega {
+                if omega_e.abs() >= config.min_spin_omega * num_pole_pairs as f32 {
                     lse.accumulate(x, y);
+                    if latched_i_q.is_none() {
+                        *latched_i_q = Some(data.target_i_dq.q);
+                    }
                 }
                 
-                *waited_s += dt;
-                if *waited_s >= config.spin_time_s {
-                    let pm_flux_linkage = lse.solve(100);
+                *ran_s += dt;
+                if *ran_s >= config.max_spin_time_s || lse.get_num_data() > 10000 {
+                    let pm_flux_linkage = lse.solve(1000);
                     let result = match pm_flux_linkage {
                         Ok(pmf) => {
-                            Some(StepResult::EstimateF { 
-                                next: Self::RampDown { pm_flux_linkage: Some(pmf), waited_s: 0.0, pending_fault: None }
+                            Some(StepResult::EstimateF {
+                                next: Self::RampDown { 
+                                    pm_flux_linkage: Some(pmf), ran_s: 0.0, pending_fault: None, 
+                                    latched_i_q: *latched_i_q, ramp_duation_s: *ran_s
+                                }
                             })
                         }
                         // Delegate the fault to the rampdown, so it still gets to execute:
                         Err(e) => {
-                            Some(StepResult::EstimateF { 
-                                next: Self::RampDown { pm_flux_linkage: None, waited_s: 0.0, pending_fault: Some(e)}
+                            Some(StepResult::EstimateF {
+                                next: Self::RampDown { 
+                                    pm_flux_linkage: None, ran_s: 0.0, pending_fault: Some(e),
+                                    latched_i_q: *latched_i_q, ramp_duation_s: *ran_s
+                                }
                             })
                         }
                     };
@@ -186,9 +196,9 @@ impl OfflineEstimatorState {
                     Ok(None)
                 }
             }
-            Self::RampDown { pm_flux_linkage, pending_fault, waited_s } => {
-                *waited_s += dt;
-                if *waited_s >= config.spin_time_s {
+            Self::RampDown { pm_flux_linkage, pending_fault, ran_s, ramp_duation_s, .. } => {
+                *ran_s += dt;
+                if *ran_s >= *ramp_duation_s{
                     if let Some(fault) = *pending_fault {
                         Err(fault)
                     } else {
@@ -203,13 +213,15 @@ impl OfflineEstimatorState {
 }
 
 pub enum OfflineEstimatorOutput {
-    Current(ClarkParkValue),
-    Voltage(ClarkParkValue),
+    CalibrationCurrent(ClarkParkValue),
+    CalibrationVoltage(ClarkParkValue),
+    Current(ClarkParkValue)
 }
 
 pub struct OfflineEstimatorInput {
     pub target_voltage: f32,
     pub target_current: f32,
+    pub dc_bus_voltage: f32,
     pub theta: f32
 }
 
@@ -222,6 +234,7 @@ pub struct OfflineMotorEstimator {
     state: OfflineEstimatorState,
     pub params: MotorParamsEstimate,
     config: OfflineEstimatorConfig,
+    should_reset_controller: bool
 }
 
 impl OfflineMotorEstimator {
@@ -230,47 +243,63 @@ impl OfflineMotorEstimator {
             state: OfflineEstimatorState::Off,
             params: MotorParamsEstimate::new_empty(),
             config,
+            should_reset_controller: false
         }
     }
 
     pub fn reset(&mut self) {
         self.state = OfflineEstimatorState::Off;
         self.params = MotorParamsEstimate::new_empty();
+        self.should_reset_controller = false;
     }
 
     pub fn start(&mut self, num_pole_pairs: u8) {
         self.params.num_pole_pairs = Some(num_pole_pairs);
         self.state = OfflineEstimatorState::RotorLockWait { waited_s: 0.0 };
+        self.should_reset_controller = false;
     }
 
     /// Returns the command for the current state.
     pub fn get_command(&self, input: OfflineEstimatorInput) -> OfflineEstimatorCommand {
         match &self.state {
             OfflineEstimatorState::RotorLockWait { .. } => OfflineEstimatorCommand {
-                output: OfflineEstimatorOutput::Current(ClarkParkValue { d: input.target_current, q: 0.0 }),
+                output: OfflineEstimatorOutput::CalibrationCurrent(ClarkParkValue { d: input.target_current, q: 0.0 }),
                 theta: 0.0,
             },
             OfflineEstimatorState::EstR { .. } => OfflineEstimatorCommand {
-                output: OfflineEstimatorOutput::Current(ClarkParkValue { d: input.target_current, q: 0.0 }),
+                output: OfflineEstimatorOutput::CalibrationCurrent(ClarkParkValue { d: input.target_current, q: 0.0 }),
                 theta: 0.0,
             },
             OfflineEstimatorState::EstL { voltage_sign, .. } => OfflineEstimatorCommand {
-                output: OfflineEstimatorOutput::Voltage(ClarkParkValue { d: *voltage_sign * input.target_voltage, q: 0.0 }),
+                output: OfflineEstimatorOutput::CalibrationVoltage(ClarkParkValue { d: *voltage_sign * input.target_voltage, q: 0.0 }),
                 theta: 0.0,
             },
-            OfflineEstimatorState::EstF { .. } => OfflineEstimatorCommand {
-                output: OfflineEstimatorOutput::Current(ClarkParkValue { d: 0.0, q: input.target_current}),
-                theta: input.theta,
+            OfflineEstimatorState::EstF { ran_s, latched_i_q,  .. } => {
+                let ramp = (ran_s / (self.config.max_spin_time_s + 1e-5)).clamp(0.0, 1.0);
+                let i_q = if let Some(val) = latched_i_q {
+                    *val
+                } else {
+                    ramp * input.target_current
+                };
+                OfflineEstimatorCommand {
+                    output: OfflineEstimatorOutput::Current(ClarkParkValue { d: 0.0, q: i_q }),
+                    theta: input.theta,
+                }
             },
-            OfflineEstimatorState::RampDown { waited_s, .. } => {
-                let factor = (1.0 - waited_s / self.config.spin_time_s).clamp(0.0, 1.0);
-                OfflineEstimatorCommand { 
-                    output: OfflineEstimatorOutput::Current(ClarkParkValue { d: 0.0, q: factor*input.target_current }), 
-                    theta: input.theta
+            OfflineEstimatorState::RampDown { ran_s, latched_i_q, ramp_duation_s, .. } => {
+                let ramp = (1.0 - ran_s / (*ramp_duation_s + 1e-5)).clamp(0.0, 1.0);
+                let i_q = if let Some(val) = latched_i_q {
+                    ramp * *val
+                } else {
+                    ramp * input.target_current
+                };
+                OfflineEstimatorCommand {
+                    output: OfflineEstimatorOutput::Current(ClarkParkValue { d: 0.0, q: i_q }),
+                    theta: input.theta,
                 }
             }
             _ => OfflineEstimatorCommand {
-                output: OfflineEstimatorOutput::Current(ClarkParkValue { d: 0.0, q: 0.0 }),
+                output: OfflineEstimatorOutput::CalibrationCurrent(ClarkParkValue { d: 0.0, q: 0.0 }),
                 theta: 0.0,
             },
         }
@@ -284,6 +313,14 @@ impl OfflineMotorEstimator {
         matches!(self.state, OfflineEstimatorState::Failure { .. })
     }
 
+    pub fn should_reset_controller(&self) -> bool {
+        self.should_reset_controller
+    }
+
+    pub fn should_tune_controller(&self) -> bool {
+        matches!(self.state, OfflineEstimatorState::TuningRequired { .. })
+    }
+
     pub fn fault(&self) -> Option<EstimationStepFault> {
         match self.state {
             OfflineEstimatorState::Failure { fault } => Some(fault),
@@ -295,38 +332,44 @@ impl OfflineMotorEstimator {
 
 impl MotorParamEstimator for OfflineMotorEstimator {
     fn after_foc_iteration(&mut self, data: FocResult) {
-        if let Some(num_pole_pairs) = self.params.num_pole_pairs {
-            match self.state.step(&data, &self.config, data.omega_e, num_pole_pairs) {
-                Err(fault) => {
-                    self.state = OfflineEstimatorState::Failure { fault }
-                }
-                Ok(Some(result)) => {
-                    match result {
-                        StepResult::Transition(next) => {
-                            self.state = next;
-                        }
-                        StepResult::EstimateR { resistance, next } => {
-                            self.params.stator_resistance = Some(resistance);
-                            self.state = next;
-                        }
-                        StepResult::EstimateL { d_inductance, next } => {
-                            self.params.d_inductance = Some(d_inductance);
-                            self.params.q_inductance = Some(d_inductance);
-                            self.state = next;
-                        }
-                        StepResult::EstimateF { next } => {
-                            self.state = next;
-                        }
-                        StepResult::RampDown { pm_flux_linkage } => { 
-                            self.params.pm_flux_linkage = pm_flux_linkage;
-                            self.state = OfflineEstimatorState::Done; 
-                        }
+        self.should_reset_controller = false;
+
+        if self.params.num_pole_pairs.is_none() {
+            self.state = OfflineEstimatorState::Failure { fault: EstimationStepFault::MissingParameter }
+        }
+        
+        match self.state.step(&data, &self.config, data.omega_e, self.params.num_pole_pairs.unwrap_or(1)) {
+            Err(fault) => {
+                self.state = OfflineEstimatorState::Failure { fault };
+                self.should_reset_controller = true;
+            }
+            Ok(Some(result)) => {
+                match result {
+                    StepResult::Transition(next) => {
+                        self.state = next;
+                    }
+                    StepResult::EstimateR { resistance, next } => {
+                        self.params.stator_resistance = Some(resistance);
+                        self.state = next;
+                        self.should_reset_controller = true;
+                    }
+                    StepResult::EstimateL { d_inductance, next } => {
+                        self.params.d_inductance = Some(d_inductance);
+                        self.params.q_inductance = Some(d_inductance);
+                        self.state = next;
+                        self.should_reset_controller = true;
+                    }
+                    StepResult::EstimateF { next } => {
+                        self.state = next;
+                    }
+                    StepResult::RampDown { pm_flux_linkage } => { 
+                        self.params.pm_flux_linkage = pm_flux_linkage;
+                        self.state = OfflineEstimatorState::Done; 
+                        self.should_reset_controller = true;
                     }
                 }
-                Ok(None) => {}
             }
-        } else {
-            self.state = OfflineEstimatorState::Failure { fault: EstimationStepFault::MissingParameter }
+            Ok(None) => {}
         }
     }
     
@@ -339,9 +382,7 @@ impl MotorParamEstimator for OfflineMotorEstimator {
 mod test {
     use super::*;
     use crate::{
-        FOC, FocConfig, FocInput, FocInputType, AngleType,
-        PMSMConfig, PMSMSim,
-        DummyAccelerator, plot_simulation, SimRecord,
+        AngleType, DummyAccelerator, FOC, FocConfig, FocInput, FocInputType, PMSMConfig, PMSMSim, SimRecord, compute_current_pi_controller_gains, plot_simulation
     };
 
     #[test]
@@ -353,16 +394,15 @@ mod test {
 
         let foc_cfg = FocConfig { saturation_d_ratio: 0.0 };
         let mut foc = FOC::new(foc_cfg, pwm_freq_hz);
-
         let mut accelerator = DummyAccelerator;
 
-        let max_current = 1.0;
-        let max_voltage = 6.0;
+        let max_current = 1.5;
+        let max_voltage = 12.0;
         let est_config = OfflineEstimatorConfig {
-            settle_time_s: 0.5,
-            test_time_s: 0.5,
-            spin_time_s: 5.0,
-            min_spin_omega: 50.0,
+            settle_time_s: 2.5,
+            test_time_s: 3.0,
+            max_spin_time_s: 20.0,
+            min_spin_omega: 100.0,
             dt,
         };
         let mut estimator = OfflineMotorEstimator::new(est_config);
@@ -371,7 +411,7 @@ mod test {
         let mut state = sim.state();
         let mut t = 0.0;
         let mut records: std::vec::Vec<SimRecord> = std::vec::Vec::new();
-        let timeout = 20.0;
+        let timeout = 60.0;
 
         while !estimator.estimation_done() {
             let theta_e = state.theta * sim_cfg.num_pole_pairs as f32;
@@ -379,13 +419,15 @@ mod test {
             let step_in = OfflineEstimatorInput {
                 target_voltage: max_voltage,
                 target_current: max_current,
+                dc_bus_voltage: sim_cfg.dc_bus_voltage,
                 theta: theta_e
             };
             let cmd = estimator.get_command(step_in);
 
             let command = match cmd.output {
-                OfflineEstimatorOutput::Current(i_dq) => FocInputType::TargetCurrents(i_dq),
-                OfflineEstimatorOutput::Voltage(u_dq) => FocInputType::TargetVoltage(u_dq),
+                OfflineEstimatorOutput::CalibrationCurrent(i_dq) => FocInputType::CalibrationCurrents(i_dq),
+                OfflineEstimatorOutput::CalibrationVoltage(u_dq) => FocInputType::CalibrationVoltage(u_dq),
+                OfflineEstimatorOutput::Current(i_dq) => FocInputType::TargetCurrents(i_dq)
             };
             let foc_input = FocInput {
                 dc_bus_voltage: sim_cfg.dc_bus_voltage,
@@ -398,6 +440,16 @@ mod test {
 
             let foc_result = foc.compute(foc_input, estimator.get_estimate(), &mut accelerator);
             estimator.after_foc_iteration(foc_result.unwrap());
+
+            if estimator.should_reset_controller() {
+                foc.reset();
+            }
+            if estimator.should_tune_controller() {
+                let pi_gains = compute_current_pi_controller_gains::<50>(
+                    estimator.get_estimate(), pwm_freq_hz
+                ).expect("Failed to tune PI controller");
+                foc.set_pi_gains(pi_gains);
+            }
 
             state = sim.step(foc_result.unwrap());
             records.push(SimRecord {

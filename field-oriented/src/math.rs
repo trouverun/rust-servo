@@ -3,6 +3,13 @@ use super::types::*;
 /// = sqrt(3)/2
 const SQRT3_2: f32 = 0.86602540378; 
 
+pub(crate) fn forward_clarke(vals: PhaseValues) -> AlphaBeta {
+    AlphaBeta {
+        alpha: 0.666667 * (vals.u - 0.5 * vals.v - 0.5 * vals.w),
+        beta: 0.666667 * (SQRT3_2 * vals.v - SQRT3_2 * vals.w),
+    }
+}
+
 pub(crate) fn forward_clark_park(vals: PhaseValues, sc: SinCosResult) -> ClarkParkValue {
     let d = 0.666667 * (sc.cos * vals.u + (-0.5*sc.cos + SQRT3_2*sc.sin) * vals.v + (-0.5*sc.cos - SQRT3_2*sc.sin) * vals.w);
     let q = 0.666667 * (-sc.sin * vals.u + (0.5*sc.sin + SQRT3_2*sc.cos) * vals.v + (0.5*sc.sin - SQRT3_2*sc.cos) * vals.w);

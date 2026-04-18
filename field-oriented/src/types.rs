@@ -47,9 +47,10 @@ pub struct FocConfig {
 type TorqueNm = f32;
 #[derive(Clone, Copy)]
 pub enum FocInputType {
+    CalibrationVoltage(ClarkParkValue),
+    CalibrationCurrents(ClarkParkValue),
     TargetCurrents(ClarkParkValue),
     TargetTorque(TorqueNm),
-    TargetVoltage(ClarkParkValue)
 }
 
 #[derive(Clone, Copy)]

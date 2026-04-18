@@ -2,15 +2,15 @@
 
 #[cfg(test)]
 extern crate std;
+#[cfg(test)]
+mod sim;
+#[cfg(test)]
+mod test_utils;
 
 mod types;
 mod math;
 mod pi_control;
 mod estimation;
-#[cfg(test)]
-mod sim;
-#[cfg(test)]
-mod test_utils;
 
 pub use crate::types::*;
 use crate::{math::*, pi_control::PIGains};
@@ -20,6 +20,7 @@ pub use crate::estimation::{
     OfflineEstimatorCommand, OfflineEstimatorOutput, OfflineEstimatorConfig,
     MotorParams, MotorParamsEstimate, MotorParamEstimator, EstimationStepFault
 };
+
 #[cfg(test)]
 pub use crate::sim::*;
 #[cfg(test)]
@@ -79,13 +80,16 @@ impl FOC {
         let measured_i_dq = forward_clark_park(input.phase_currents, sc_e);
 
         let (u_dq, target_i_dq) = match input.command {
-            FocInputType::TargetVoltage(voltage) => {
+            FocInputType::CalibrationVoltage(voltage) => {
                 (voltage, ClarkParkValue { d: 0.0, q: 0.0 })
             }
-            FocInputType::TargetCurrents(target_i_dq) => {
+            FocInputType::CalibrationCurrents(target_i_dq) => {
                 let u_d = self.calibration_d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
                 let u_q = self.calibration_q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
                 (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
+            }
+            FocInputType::TargetCurrents(target_i_dq) => {
+                self.compute_voltages(target_i_dq, measured_i_dq, omega_e, 0.0, motor_params)?
             }
             FocInputType::TargetTorque(target_torque) => {
                 // Derive target q,d-axis currents from torque command:
@@ -95,18 +99,8 @@ impl FOC {
                 } else {
                     0.0
                 };
-                
-                let target_i_dq = ClarkParkValue { d: 0.0, q: k_tau * target_torque };
-                let mut u_d = self.d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
-                let mut u_q = self.q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
-
-                // Cross-coupling compensation feedforward:
-                let q_inductance = motor_params.q_inductance.ok_or(FocFault::MissingMotorParams)?;
-                u_d += -q_inductance*measured_i_dq.q*omega_e;
-                let d_inductance =  motor_params.d_inductance.ok_or(FocFault::MissingMotorParams)?;
-                u_q += omega_e*(pm_flux_linkage + d_inductance*measured_i_dq.d);
-
-                (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
+                let target_i_dq = ClarkParkValue { d: 0.0, q: k_tau * target_torque };              
+                self.compute_voltages(target_i_dq, measured_i_dq, omega_e, pm_flux_linkage, motor_params)?
             }
         };
 
@@ -159,6 +153,21 @@ impl FOC {
         })
     }
 
+    fn compute_voltages(&mut self, 
+        target_i_dq: ClarkParkValue, measured_i_dq: ClarkParkValue, 
+        omega_e: f32, pm_flux_linkage: f32, motor_params: MotorParamsEstimate
+    ) -> Result<(ClarkParkValue, ClarkParkValue), FocFault> {
+        let mut u_d = self.d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
+        let mut u_q = self.q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
+        // Cross-coupling compensation feedforward:
+        let q_inductance = motor_params.q_inductance.ok_or(FocFault::MissingMotorParams)?;
+        u_d += -q_inductance*measured_i_dq.q*omega_e;
+        let d_inductance =  motor_params.d_inductance.ok_or(FocFault::MissingMotorParams)?;
+        u_q += omega_e*(pm_flux_linkage + d_inductance*measured_i_dq.d);
+
+        Ok((ClarkParkValue { d: u_d, q: u_q }, target_i_dq))
+    }
+
     pub fn set_pi_gains(&mut self, gains: ControllerParameters) {
         self.d_pi.set_gains(gains.d_pi);
         self.q_pi.set_gains(gains.q_pi);
@@ -209,7 +218,7 @@ mod tests {
         );
 
         if let Some(gains) = compute_current_pi_controller_gains::<50>(
-            motor_params.to_params().unwrap(), pwm_freq_hz
+            motor_params, pwm_freq_hz
         ) {
             foc.set_pi_gains(gains);
         } else {

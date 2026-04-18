@@ -42,4 +42,8 @@ impl Lse {
             Err(EstimationStepFault::DegenSolution)
         }
     }
+
+    pub fn get_num_data(&self) -> u32 {
+        self.num_data
+    }
 }
