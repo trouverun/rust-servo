@@ -110,10 +110,6 @@ pub fn map_peripherals(p: embassy_stm32::Peripherals) ->
                 .with_ch2(p.PC7).with_ch2n(p.PC11)
                 .with_ch3(p.PC8).with_ch3n(p.PC12)
                 .with_break2_pin(p.PD1, Bkinp::INVERTED, Bkp::ACTIVE_HIGH, FilterValue::FCK_INT_N4),
-        /*pwm: PWM::new(p.TIM1, super::PWM_FREQ, super::COUNTING_MODE)
-                .with_ch1(p.PE9).with_ch1n(p.PE8)
-                .with_ch2(p.PE11).with_ch2n(p.PE10)
-                .with_ch3(p.PE13).with_ch3n(p.PB9),*/
         deadtime: PwmDeadtime::Nanosecods(300)
     };
 

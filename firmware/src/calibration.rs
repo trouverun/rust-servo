@@ -22,7 +22,7 @@ pub struct CalibrationOutput {
 }
 
 #[derive(defmt::Format)]
-pub enum FailureCause {
+pub enum CalibrationFailureCause {
     MissingParameter,
     MotorParameterEstimation { fault: EstimationStepFault },
 }
@@ -38,7 +38,7 @@ pub enum StageResult {
         motor_params: MotorParamsEstimate
     },
     Failure {
-        cause: FailureCause
+        cause: CalibrationFailureCause
     }
 }
 
@@ -62,7 +62,7 @@ impl CalibrationRunner {
             settle_time_s: 3.0,
             test_time_s: 5.0,
             max_spin_time_s: 15.0,
-            min_spin_omega: 100.0
+            min_spin_omega: 250.0
         };
         let motor_estimator = OfflineMotorEstimator::new(cfg);
         Self {
@@ -77,7 +77,7 @@ impl CalibrationRunner {
         self.hall_calibrator.start();
     }
 
-    pub fn tick(&mut self, 
+    pub fn step(&mut self, 
         inputs: CalibrationInputs,
     ) -> (CalibrationOutput, Option<StageResult>) {
         match self.phase {
@@ -95,7 +95,7 @@ impl CalibrationRunner {
                     } else {
                         self.phase = CalibrationPhase::Done;
                         let output = self.idle_output(inputs);
-                        (output, Some(StageResult::Failure { cause: FailureCause::MissingParameter }))
+                        (output, Some(StageResult::Failure { cause: CalibrationFailureCause::MissingParameter }))
                     }
                 } else {
                     const PWM_FREQ_HZ : u32 = PWM_FREQ.0;
@@ -129,7 +129,7 @@ impl CalibrationRunner {
                     self.phase = CalibrationPhase::Done;
                     let output = self.idle_output(inputs);
                     (output, Some(StageResult::Failure { 
-                        cause: FailureCause::MotorParameterEstimation { fault }
+                        cause: CalibrationFailureCause::MotorParameterEstimation { fault }
                     }))
                 } else {
                     let output = self.motor_estimation_output(inputs);

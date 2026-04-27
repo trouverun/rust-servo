@@ -23,6 +23,7 @@ use field_oriented::{
 };
 use crate::boards::*;
 use crate::types::FirmwareConfig;
+use crate::utils::LowPassFilter;
 
 const ADC_VOLTAGE: f32 = 3.3;
 const OPAMP_GAIN_RECIPROCAL: f32 = 1.0 / BOARD.opamp_gain;
@@ -269,22 +270,24 @@ pub struct HallFeedback {
     /// Forward hall sequence: sector_span[pattern] leads to forward_next[pattern].
     /// Used to determine rotation direction from pattern transitions.
     forward_next: Option<[u8; 6]>,
+    state: HallInterpolationState,
     prev_pattern: u8,
     prev_dir: i8,
-    state: HallInterpolationState
+    filter: LowPassFilter
 }
 
 #[cfg(feature = "hall-feedback")]
 impl HallFeedback {
-    pub fn new(mappings: HallFeedbackMappings) -> Self {
+    pub fn new(mappings: HallFeedbackMappings, cutoff_hz: f32) -> Self {
         Self {
             sensor: mappings.sensor,
             hall_pattern_to_theta: None,
             sector_span: None,
             forward_next: None,
+            state: HallInterpolationState::Stationary,
             prev_pattern: 0,
             prev_dir: 0,
-            state: HallInterpolationState::Stationary
+            filter: LowPassFilter::new(cutoff_hz)
         }
     }
 
@@ -377,8 +380,6 @@ impl HasRotorFeedback for HallFeedback {
         let span = sector_span[idx] as f32;
         // Fraction of previous period elapsed:
         let fraction = raw_state.extended_counter as f32 * raw_state.hall_period_reciprocal_count;
-        // The interpolated theta accumulation, accounting for the potentially smaller range of span vs prev span:
-        let theta_interpolation = dir as f32 * (prev_span * fraction).clamp(0.0, span);
 
         self.state.step(self.prev_pattern, raw_state.pattern, self.prev_dir, dir);
         let (theta, omega) = match self.state {
@@ -393,12 +394,14 @@ impl HasRotorFeedback for HallFeedback {
                 // - allow interpolation up to the midpoint of the current sector
                 //   (prevent being off by a full sector, if oscillating around same edge)
                 // - set omega to zero, to avoid huge values caused by oscillating around same edge rapidly
+                let theta_interpolation = dir as f32 * (prev_span * fraction).clamp(0.0, 0.5*span);
                 let theta = hall_pattern_to_theta[entry_idx] + theta_interpolation;
                 let omega = 0.0;
                 (theta, omega)
             }
             HallInterpolationState::Normal => {
                 // Interpolate up to the next Hall edge angle:
+                let theta_interpolation = dir as f32 * (prev_span * fraction).clamp(0.0, span);
                 let theta = hall_pattern_to_theta[entry_idx] + theta_interpolation;
                 let signed_prev_span = dir as f32 * prev_span;
                 // Compute angular velocity from: rad * 1/ticks * Hz (ticks/s) = rad/s
@@ -415,7 +418,9 @@ impl HasRotorFeedback for HallFeedback {
         self.prev_pattern = raw_state.pattern;
         self.prev_dir = dir;
 
-        Ok(RotorFeedback { theta, omega })
+        let filtered_omega = self.filter.update(omega);
+
+        Ok(RotorFeedback { theta, omega: filtered_omega })
     }
 }
 

@@ -6,37 +6,67 @@ pub fn iir_cutoff_to_alpha(cutoff_hz: f32) -> f32 {
     libm::expf(-TAU * cutoff_hz / PWM_FREQ.0 as f32)
 }
 
-pub struct PhaseCurrentFilter {
+pub struct LowPassFilter {
     alpha: f32,
-    filtered: PhaseValues,
-    prev_measurement: PhaseValues,
+    prev_filtered_value: f32,
+    prev_measurement: f32
+}
+
+impl LowPassFilter {
+    pub fn new(cutoff_hz: f32) -> Self {
+        Self {
+            alpha: iir_cutoff_to_alpha(cutoff_hz),
+            prev_filtered_value: 0.0,
+            prev_measurement: 0.0
+        }
+    }
+
+    pub fn update(&mut self, measurement: f32) -> f32 {
+        self.prev_filtered_value = self.alpha * self.prev_filtered_value + (1.0-self.alpha) * self.prev_measurement;
+        self.prev_measurement = measurement;
+        self.prev_filtered_value
+    }
+
+    pub fn filtered(&self) -> f32 {
+        self.prev_filtered_value
+    }
+}
+
+pub struct FilteredPhases {
+    u: LowPassFilter,
+    v: LowPassFilter,
+    w: LowPassFilter
+}
+
+pub struct PhaseCurrentFilter {
+    filters: FilteredPhases,
     overcurrent_limit: f32,
 }
 
 impl PhaseCurrentFilter {
     pub fn new(lowpass_cutoff_hz: f32, overcurrent_limit: f32) -> Self {
+        let filters = FilteredPhases {
+            u: LowPassFilter::new(lowpass_cutoff_hz),
+            v: LowPassFilter::new(lowpass_cutoff_hz),
+            w: LowPassFilter::new(lowpass_cutoff_hz)
+        };
         Self {
-            alpha: iir_cutoff_to_alpha(lowpass_cutoff_hz),
-            filtered: PhaseValues { u: 0.0, v: 0.0, w: 0.0 },
-            prev_measurement: PhaseValues { u: 0.0, v: 0.0, w: 0.0 },
+            filters,
             overcurrent_limit,
         }
     }
 
     /// Update the filter with a new measurement.
     pub fn update(&mut self, measurement: PhaseValues) {
-        let a = self.alpha;
-        let b = 1.0 - a;
-        self.filtered.u = a * self.filtered.u + b * self.prev_measurement.u;
-        self.filtered.v = a * self.filtered.v + b * self.prev_measurement.v;
-        self.filtered.w = a * self.filtered.w + b * self.prev_measurement.w;
-        self.prev_measurement = measurement;
+        self.filters.u.update(measurement.u);
+        self.filters.v.update(measurement.v);
+        self.filters.w.update(measurement.w);
     }
 
-    pub fn overcurrent(&self) -> bool {
-        self.filtered.u.abs() > self.overcurrent_limit
-            || self.filtered.v.abs() > self.overcurrent_limit
-            || self.filtered.w.abs() > self.overcurrent_limit
+    pub fn check_overcurrent(&self) -> bool {
+        self.filters.u.filtered().abs() > self.overcurrent_limit
+            || self.filters.v.filtered() > self.overcurrent_limit
+            || self.filters.w.filtered() > self.overcurrent_limit
     }
 
     pub fn set_overcurrent_limit(&mut self, limit: f32) {
@@ -44,6 +74,10 @@ impl PhaseCurrentFilter {
     }
 
     pub fn filtered(&self) -> PhaseValues {
-        self.filtered
+        PhaseValues { 
+            u: self.filters.u.filtered(),
+            v: self.filters.v.filtered(),
+            w: self.filters.w.filtered() 
+        }
     }
 }
