@@ -33,7 +33,7 @@ pub struct ClarkParkValue {
     pub q: f32
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, defmt::Format)]
 pub struct PhaseValues {
     pub u: f32,
     pub v: f32,

@@ -1,4 +1,4 @@
-use crate::{MotorParams, MotorParamsEstimate};
+use crate::{MotorParamsEstimate, ControllerParameters};
 use libm::{cosf, expf, powf, sinf};
 use num_complex::{Complex32};
 
@@ -60,7 +60,7 @@ impl PIController {
         self.gains = gains;
     }
 
-    pub fn reset(&mut self) {
+    pub fn clear_windup(&mut self) {
         self.integral_term = 0.0;
         self.prev_reference = 0.0;
         self.prev_rf = 0.0;
@@ -70,7 +70,7 @@ impl PIController {
 // PI autotuning based on step response requirements using pole-placement 
 pub fn compute_current_pi_controller_gains<const N: usize>(
     params: MotorParamsEstimate, pwm_freq_hz: f32
-) -> Option<crate::ControllerParameters> {
+) -> Option<ControllerParameters> {
     let R = params.stator_resistance?;
     let L = params.q_inductance?;
     let T = 1.0 / pwm_freq_hz;
@@ -87,7 +87,7 @@ pub fn compute_current_pi_controller_gains<const N: usize>(
     let ki = R*C1 * (C2 - 2.0*expf(-400.0*T)*cosf(419.4757564*T) + 1.0) / (T*(C1 - 1.0));
     let z0 = kp/(kp+T*ki); // Zero cancellation setpoint filter
 
-    let gains = crate::ControllerParameters {
+    let gains = ControllerParameters {
         d_pi: PIGains { kr: z0, kp: kp, ki: ki, kt: 1.0/kp },
         q_pi: PIGains { kr: z0, kp: kp, ki: ki, kt: 1.0/kp }
     };
@@ -119,7 +119,7 @@ struct PolyTerms {
 }
 
 /// Collect the polynomial coefficients for the transfer function T(z) = (C(z)P(z)) / (1 + C(z)P(z))
-fn polyterm_T(R: f32, L: f32, gains: &crate::ControllerParameters, pwm_freq_hz: f32) -> PolyTerms {
+fn polyterm_T(R: f32, L: f32, gains: &ControllerParameters, pwm_freq_hz: f32) -> PolyTerms {
     let T = 1.0 / pwm_freq_hz;
     let kp = gains.q_pi.kp;
     let ki = gains.q_pi.ki;
@@ -160,7 +160,7 @@ fn eval_mag(polyterms: &PolyTerms, z: Complex32) -> f32 {
 /// Robust stability check using a grid search over parameter variations and frequencies,
 /// checking the small-gain theorem for all of them
 fn small_gain_stability_check<const N: usize>(
-    R: f32, L: f32, gains: &crate::ControllerParameters, pwm_freq_hz: f32,
+    R: f32, L: f32, gains: &ControllerParameters, pwm_freq_hz: f32,
     R_perturb: &[f32], L_perturb: &[f32]
 ) -> bool {
     let T = 1.0 / pwm_freq_hz;
@@ -168,7 +168,7 @@ fn small_gain_stability_check<const N: usize>(
     let mut z_vals = [Complex32::new(0.0, 0.0); N];
     let mut t_vals = [0.0; N];
 
-    // Logarithmic spacing of frequencies (0 to ~5kHz or ~30k rad/s):
+    // Logarithmic spacing of frequencies (0 to ~5kHz, or 0 to ~30k rad/s):
     let r = powf(3e4, 1.0 / N as f32);
     let mut omega = 1.0;
 

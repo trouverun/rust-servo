@@ -180,11 +180,11 @@ impl FOC {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.calibration_d_pi.reset();
-        self.calibration_q_pi.reset();
-        self.d_pi.reset();
-        self.q_pi.reset();
+    pub fn clear_windup(&mut self) {
+        self.calibration_d_pi.clear_windup();
+        self.calibration_q_pi.clear_windup();
+        self.d_pi.clear_windup();
+        self.q_pi.clear_windup();
     }
 }
 

@@ -357,7 +357,6 @@ impl MotorParamEstimator for OfflineMotorEstimator {
                         self.params.d_inductance = Some(d_inductance);
                         self.params.q_inductance = Some(d_inductance);
                         self.state = next;
-                        self.should_reset_controller = true;
                     }
                     StepResult::EstimateF { next } => {
                         self.state = next;
@@ -442,7 +441,7 @@ mod test {
             estimator.after_foc_iteration(foc_result.unwrap());
 
             if estimator.should_reset_controller() {
-                foc.reset();
+                foc.clear_windup();
             }else if estimator.should_tune_controller() {
                 let pi_gains = compute_current_pi_controller_gains::<50>(
                     estimator.get_estimate(), pwm_freq_hz
