@@ -238,10 +238,12 @@ pub struct OfflineMotorEstimator {
 }
 
 impl OfflineMotorEstimator {
-    pub fn new(config: OfflineEstimatorConfig) -> Self {
+    pub fn new(config: OfflineEstimatorConfig, num_pole_pairs: u8) -> Self {
+        let mut params = MotorParamsEstimate::new_empty();
+        params.num_pole_pairs = Some(num_pole_pairs);
         Self {
             state: OfflineEstimatorState::Off,
-            params: MotorParamsEstimate::new_empty(),
+            params,
             config,
             should_reset_controller: false
         }
@@ -404,7 +406,7 @@ mod test {
             min_spin_omega: 100.0,
             dt,
         };
-        let mut estimator = OfflineMotorEstimator::new(est_config);
+        let mut estimator = OfflineMotorEstimator::new(est_config, 2);
         estimator.start(sim_cfg.num_pole_pairs as u8);
 
         let mut state = sim.state();

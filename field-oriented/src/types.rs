@@ -1,5 +1,7 @@
 pub enum RotorFeedbackFault {
-    NotCalibrated
+    NotCalibrated,
+    NoResponse,
+    ErroneusValue
 }
 
 pub struct RotorFeedback {
