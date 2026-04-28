@@ -1,10 +1,14 @@
-use field_oriented::{FocFault, EstimationStepFault};
+use crate::boards::PWM_FREQ;
 use crate::calibration::CalibrationFailureCause;
+use field_oriented::{EstimationStepFault, FocFault, HallCalibrator, OfflineMotorEstimator, OfflineEstimatorConfig};
+use defmt::{Format, Formatter, write, info};
 
 #[derive(Clone, Copy, defmt::Format)]
 pub enum FaultCause {
     Empty,
     Overcurrent,
+    Break1,
+    Break2,
     CalibrationFail,
     EstimationFail,
     ControllerTuningFail,
@@ -35,16 +39,16 @@ impl From<CalibrationFailureCause> for FaultCause {
     fn from(f: CalibrationFailureCause) -> Self {
         match f {
             CalibrationFailureCause::MissingParameter => FaultCause::MissingMotorParams,
-            CalibrationFailureCause::MotorParameterEstimation { fault } => fault.into()
+            CalibrationFailureCause::MotorParameterEstimation { fault } => fault.into(),
         }
     }
 }
 
+#[derive(Clone, Copy, defmt::Format)]
 pub enum Command {
     Idle,
-    StartCalibration,
+    StartCalibration { num_pole_pairs: u8 },
     FinishCalibration,
-    StartTuning,
     FinishTuning,
     EnableTorqueControl,
     EnableVelocityControl,
@@ -52,68 +56,82 @@ pub enum Command {
 }
 
 #[derive(Clone, Copy, defmt::Format)]
+pub enum CalibrationPhase {
+    HallCalibration,
+    MotorEstimation,
+    MotorTuning,
+    Done,
+}
+
+pub struct CalibrationRunner {
+    pub num_pole_pairs: u8,
+    pub hall_calibrator: HallCalibrator,
+    pub motor_estimator: OfflineMotorEstimator,
+    pub phase: CalibrationPhase,
+}
+
 pub enum OperatingMode {
     Idle,
-    Calibration,
-    ControllerTuning,
+    Calibration { calibrator: CalibrationRunner },
     TorqueControl,
     VelocityControl,
-    Fault { 
-        write_index: usize, 
-        trace: [FaultCause; 16]
+    Fault {
+        write_index: usize,
+        trace: [FaultCause; 16],
+    },
+}
+
+impl Format for OperatingMode {
+    fn format(&self, f: Formatter<'_>) {
+        match self {
+            OperatingMode::Idle => {
+                write!(f, "Idle")
+            }
+            OperatingMode::Calibration { calibrator, .. } => {
+                write!(f, "Calibration {{ phase: {} }}", calibrator.phase)
+            }
+            OperatingMode::TorqueControl => {
+                write!(f, "TorqueControl")
+            }
+            OperatingMode::VelocityControl => {
+                write!(f, "VelocityControl")
+            }
+            OperatingMode::Fault { write_index, trace } => {
+                write!(f, "Fault {{ write_index: {}, trace: {} }}", write_index, trace)
+            }
+        }
     }
 }
 
 impl OperatingMode {
-    pub fn on_command(&mut self, command: Command) -> Self {
-        match (*self, command) {
-            // Transition from fault to fault, append to fault trace:
-            (OperatingMode::Fault { mut write_index, mut trace }, Command::AssertFault { cause }) => {
-                if write_index < trace.len() {
-                    trace[write_index] = cause;
-                    write_index += 1;
+    pub fn on_command(&mut self, command: Command) {
+        info!("On command {}, state {}", command, &*self);
+        let new_state = match (&mut *self, command) {
+            (OperatingMode::Fault { write_index, trace }, Command::AssertFault { cause }) => {
+                if *write_index < trace.len() {
+                    trace[*write_index] = cause;
+                    *write_index += 1;
                 }
-                OperatingMode::Fault { write_index, trace }
-            },
-            // Transition from any other mode to fault, start from scratch:
+                return;
+            }
             (_, Command::AssertFault { cause }) => {
                 let mut trace = [FaultCause::Empty; 16];
                 trace[0] = cause;
                 OperatingMode::Fault { write_index: 1, trace }
-            },
-            (OperatingMode::Idle, Command::StartCalibration) => OperatingMode::Calibration,
+            }
+            (OperatingMode::Idle, Command::StartCalibration { num_pole_pairs } ) => {
+                OperatingMode::Calibration { calibrator: CalibrationRunner::new(num_pole_pairs) }
+            }
             (OperatingMode::Idle, Command::EnableTorqueControl) => OperatingMode::TorqueControl,
-            (OperatingMode::Calibration, Command::StartTuning) => OperatingMode::ControllerTuning,
-            (OperatingMode::Calibration, Command::FinishCalibration) => OperatingMode::Idle,
-            (OperatingMode::ControllerTuning, Command::FinishTuning) => OperatingMode::Calibration,
+            (OperatingMode::Calibration { calibrator }, Command::FinishTuning) => {
+                calibrator.tuning_completed();
+                return;
+            }
+            (OperatingMode::Calibration { .. }, Command::FinishCalibration) => OperatingMode::Idle,
             (OperatingMode::TorqueControl, Command::Idle) => OperatingMode::Idle,
-            (_, _) => *self
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum EdgeType {
-    Rising,
-    Falling,
-}
-
-#[derive(Clone, Copy)]
-pub enum ButtonState {
-    Waiting,
-    LongPress,
-    ShortPress,
-    DoublePress
-}
-
-impl ButtonState {
-    pub fn on_edge(&self, edge: EdgeType) -> Self {
-        match (self, edge) {
-            (ButtonState::Waiting, EdgeType::Rising) => ButtonState::LongPress,
-            (ButtonState::LongPress, EdgeType::Falling) => ButtonState::ShortPress,
-            (ButtonState::ShortPress, EdgeType::Rising) => ButtonState::DoublePress,
-            (_, _) => *self
-        }
+            (_, _) => return,
+        };
+        *self = new_state;
     }
 }
 
@@ -135,7 +153,7 @@ impl Default for FirmwareConfig {
             calibration_voltage: 18.0,
             calibration_current: 1.5,
             calibration_omega: 1.0,
-            current_limit: 0.0
+            current_limit: 0.0,
         }
     }
 }
@@ -148,7 +166,33 @@ pub struct RuntimeValues {
 impl Default for RuntimeValues {
     fn default() -> Self {
         Self {
-            target_omega: 0.0, target_torque: 0.0
+            target_omega: 0.0,
+            target_torque: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub enum EdgeType {
+    Rising,
+    Falling,
+}
+
+#[derive(Clone, Copy)]
+pub enum ButtonState {
+    Waiting,
+    LongPress,
+    ShortPress,
+    DoublePress,
+}
+
+impl ButtonState {
+    pub fn on_edge(&self, edge: EdgeType) -> Self {
+        match (self, edge) {
+            (ButtonState::Waiting, EdgeType::Rising) => ButtonState::LongPress,
+            (ButtonState::LongPress, EdgeType::Falling) => ButtonState::ShortPress,
+            (ButtonState::ShortPress, EdgeType::Rising) => ButtonState::DoublePress,
+            (_, _) => *self,
         }
     }
 }

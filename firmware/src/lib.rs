@@ -3,8 +3,8 @@
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 use defmt_rtt as _;
-use panic_probe as _;
 use embassy_stm32 as _;
+use panic_probe as _;
 
 // same panicking *behavior* as `panic-probe` but doesn't print a panic message
 // this prevents the panic message being printed *twice* when `defmt::panic` is invoked

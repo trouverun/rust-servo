@@ -1,17 +1,24 @@
+use embassy_stm32::adc::AnyAdcChannel;
+use embassy_stm32::comp::Comp;
+use embassy_stm32::dac::{Dac, DacChannel};
+#[cfg(feature = "spi-encoder")]
+use embassy_stm32::gpio::Output;
+#[cfg(feature = "rs485-encoder")]
+use embassy_stm32::mode::Async;
+use embassy_stm32::mode::Blocking;
 #[cfg(feature = "mcu-opamps")]
 use embassy_stm32::opamp::OpAmpOutput;
-use embassy_stm32::mode::Blocking;
+use embassy_stm32::peripherals::{CORDIC, FLASH};
+#[cfg(feature = "spi-encoder")]
+use embassy_stm32::spi::{mode::Master, Spi};
 use embassy_stm32::time::Hertz;
-use embassy_stm32::timer::pwm::{NotRunning, PWM, PwmDeadtime};
-use embassy_stm32::timer::{CountingMode, trigger_output::BasicTrgoOutput};
 #[cfg(feature = "hall-feedback")]
 use embassy_stm32::timer::hall::HallSensor;
-use embassy_stm32::{Peri};
-use embassy_stm32::adc::{AnyAdcChannel};  
-use embassy_stm32::dac::{Dac, DacChannel};
-use embassy_stm32::comp::Comp;
-use embassy_stm32::peripherals::{CORDIC, FLASH};
-
+use embassy_stm32::timer::pwm::{NotRunning, PwmDeadtime, PWM};
+use embassy_stm32::timer::{trigger_output::BasicTrgoOutput, CountingMode};
+#[cfg(feature = "rs485-encoder")]
+use embassy_stm32::usart::Uart;
+use embassy_stm32::Peri;
 
 #[cfg(feature = "board-zest1")]
 mod zest1;
@@ -23,14 +30,14 @@ pub const COUNTING_MODE: CountingMode = CountingMode::CenterAlignedBothInterrupt
 
 pub struct TherimistorLinearScale {
     pub slope: f32,
-    pub bias: f32
+    pub bias: f32,
 }
 
 pub struct BoardInfo {
     pub shunt_resistance_mohm: f32,
     pub opamp_gain: f32,
     pub vbus_divide_factor: f32,
-    pub thermistor_scaling: TherimistorLinearScale
+    pub thermistor_scaling: TherimistorLinearScale,
 }
 
 #[cfg(feature = "mcu-opamps")]
@@ -56,6 +63,12 @@ pub struct AdcFeedbackMappings {
 #[cfg(feature = "hall-feedback")]
 pub struct HallFeedbackMappings {
     pub sensor: HallSensor<'static, HallFeedbackTimer>,
+}
+
+#[cfg(feature = "spi-encoder")]
+pub struct SPIEncoderMappings {
+    pub spi: Spi<'static, Blocking, Master>,
+    pub cs: Output<'static>,
 }
 
 #[cfg(feature = "overcurrent-comparators")]

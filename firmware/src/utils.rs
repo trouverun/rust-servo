@@ -1,6 +1,12 @@
+use crate::boards::PWM_FREQ;
 use core::f32::consts::TAU;
 use field_oriented::PhaseValues;
-use crate::boards::PWM_FREQ;
+use num_traits::Float;
+
+pub fn wrap_to_pi(angle_rad: f32) -> f32 {
+    const INV_TAU: f32 = 1.0 / TAU;
+    angle_rad - TAU * (angle_rad * INV_TAU).round()
+}
 
 pub fn iir_cutoff_to_alpha(cutoff_hz: f32) -> f32 {
     libm::expf(-TAU * cutoff_hz / PWM_FREQ.0 as f32)
@@ -9,7 +15,7 @@ pub fn iir_cutoff_to_alpha(cutoff_hz: f32) -> f32 {
 pub struct LowPassFilter {
     alpha: f32,
     prev_filtered_value: f32,
-    prev_measurement: f32
+    prev_measurement: f32,
 }
 
 impl LowPassFilter {
@@ -17,12 +23,13 @@ impl LowPassFilter {
         Self {
             alpha: iir_cutoff_to_alpha(cutoff_hz),
             prev_filtered_value: 0.0,
-            prev_measurement: 0.0
+            prev_measurement: 0.0,
         }
     }
 
     pub fn update(&mut self, measurement: f32) -> f32 {
-        self.prev_filtered_value = self.alpha * self.prev_filtered_value + (1.0-self.alpha) * self.prev_measurement;
+        self.prev_filtered_value =
+            self.alpha * self.prev_filtered_value + (1.0 - self.alpha) * self.prev_measurement;
         self.prev_measurement = measurement;
         self.prev_filtered_value
     }
@@ -35,7 +42,7 @@ impl LowPassFilter {
 pub struct FilteredPhases {
     u: LowPassFilter,
     v: LowPassFilter,
-    w: LowPassFilter
+    w: LowPassFilter,
 }
 
 pub struct PhaseCurrentFilter {
@@ -48,7 +55,7 @@ impl PhaseCurrentFilter {
         let filters = FilteredPhases {
             u: LowPassFilter::new(lowpass_cutoff_hz),
             v: LowPassFilter::new(lowpass_cutoff_hz),
-            w: LowPassFilter::new(lowpass_cutoff_hz)
+            w: LowPassFilter::new(lowpass_cutoff_hz),
         };
         Self {
             filters,
@@ -74,10 +81,10 @@ impl PhaseCurrentFilter {
     }
 
     pub fn filtered(&self) -> PhaseValues {
-        PhaseValues { 
+        PhaseValues {
             u: self.filters.u.filtered(),
             v: self.filters.v.filtered(),
-            w: self.filters.w.filtered() 
+            w: self.filters.w.filtered(),
         }
     }
 }
