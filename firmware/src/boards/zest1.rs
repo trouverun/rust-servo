@@ -3,7 +3,7 @@ use embassy_stm32::adc::{
     AnyAdcChannel, EocInterruptEnabled, Exten, ExternalTriggeredADC, JeosInterruptEnabled,
     NotQueued, Resolution, Running, SampleTime,
 };
-use embassy_stm32::comp::*;
+use embassy_stm32::{comp::*};
 use embassy_stm32::dac::Ch1;
 use embassy_stm32::dac::{Dac, DacCh1};
 use embassy_stm32::exti::{ExtiInput, TriggerEdge};
@@ -13,17 +13,17 @@ use embassy_stm32::opamp::{OpAmp, OpAmpSpeed};
 use embassy_stm32::pac::timer::vals::{Bkinp, Bkp};
 use embassy_stm32::peripherals::{
     ADC1, ADC3, ADC4, COMP4, COMP6, COMP7, DAC1, DAC4, OPAMP3, OPAMP4, OPAMP5, TIM3, TIM4, TIM6,
-    TIM8,
+    TIM8, SPI1
 };
-use embassy_stm32::spi::{Config as SpiConfig, Spi, MODE_0};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::hall::{Config as HallConfig, HallSensor};
-use embassy_stm32::timer::low_level::{RoundTo, Timer};
 use embassy_stm32::timer::{
     low_level::FilterValue,
     pwm::{PwmDeadtime, PWM},
     trigger_output::BasicTrgoOutput,
 };
+
+use crate::boards::encoder_mappings;
 
 // Adc feedback:
 pub type OpAmpU = OPAMP3;
@@ -38,6 +38,10 @@ pub const BOARD_FEEDBACK_TRIGGER: Adc345RegularTrigger = Adc345RegularTrigger::T
 
 // Hall feedback:
 pub type HallFeedbackTimer = TIM3;
+
+// Encoder feedback:
+pub type EncoderDMATimer = TIM4;
+pub type EncoderSpi = SPI1;
 
 // PWM output:
 pub type CompU = COMP4;
@@ -70,7 +74,7 @@ pub fn map_peripherals(
 ) -> (
     super::AdcFeedbackMappings,
     super::HallFeedbackMappings,
-    super::SPIEncoderMappings,
+    super::SPIEncoderMappings<EncoderSpi, EncoderDMATimer>,
     super::PwmOutputMappings,
     super::AccelerationMappings,
     super::MemoryMappings,
@@ -95,15 +99,11 @@ pub fn map_peripherals(
     let hall_feedback = super::HallFeedbackMappings {
         sensor: HallSensor::new(p.TIM3, p.PE2, p.PE3, p.PE4, HallConfig::default()),
     };
-
-    let mut amt22_spi_config = SpiConfig::default();
-    amt22_spi_config.mode = MODE_0;
-    amt22_spi_config.frequency = Hertz(2_000_000);
-    amt22_spi_config.gpio_speed = Speed::VeryHigh;
-    let spi_encoder = super::SPIEncoderMappings {
-        spi: Spi::new_blocking(p.SPI1, p.PA5, p.PA7, p.PA6, amt22_spi_config),
-        cs: Output::new(p.PA15, Level::High, Speed::VeryHigh),
-    };
+    let amt_encoder = encoder_mappings(
+        p.SPI1, p.PA5,  p.PA7, p.PG3, p.PA15,
+        p.TIM4, p.DMA1_CH1, p.DMA1_CH2, 
+        p.DMA1_CH3, p.DMA1_CH4, p.DMA1_CH5
+    );
 
     let pwm = super::PwmOutputMappings {
         comparators: super::CurrentComparators {
@@ -145,7 +145,6 @@ pub fn map_peripherals(
     };
 
     let acceleration = super::AccelerationMappings { cordic: p.CORDIC };
-
     let storage = super::MemoryMappings { flash: p.FLASH };
 
     // Board specific debug assignments:
@@ -175,7 +174,7 @@ pub fn map_peripherals(
     (
         adc_feedback,
         hall_feedback,
-        spi_encoder,
+        amt_encoder,
         pwm,
         acceleration,
         storage,

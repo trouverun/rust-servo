@@ -37,6 +37,11 @@ impl LowPassFilter {
     pub fn filtered(&self) -> f32 {
         self.prev_filtered_value
     }
+
+    pub fn reset(&mut self) {
+        self.prev_filtered_value = 0.0;
+        self.prev_measurement = 0.0;
+    }
 }
 
 pub struct FilteredPhases {

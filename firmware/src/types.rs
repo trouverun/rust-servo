@@ -1,6 +1,5 @@
-use crate::boards::PWM_FREQ;
 use crate::calibration::CalibrationFailureCause;
-use field_oriented::{EstimationStepFault, FocFault, HallCalibrator, OfflineMotorEstimator, OfflineEstimatorConfig};
+use field_oriented::{EstimationStepFault, FocFault, HallCalibrator, OfflineMotorEstimator};
 use defmt::{Format, Formatter, write, info};
 
 #[derive(Clone, Copy, defmt::Format)]
@@ -9,7 +8,7 @@ pub enum FaultCause {
     Overcurrent,
     Break1,
     Break2,
-    CalibrationFail,
+    CalibrationTimeout,
     EstimationFail,
     ControllerTuningFail,
     MissingMotorParams,
@@ -38,6 +37,7 @@ impl From<EstimationStepFault> for FaultCause {
 impl From<CalibrationFailureCause> for FaultCause {
     fn from(f: CalibrationFailureCause) -> Self {
         match f {
+            CalibrationFailureCause::Timeout => FaultCause::CalibrationTimeout,
             CalibrationFailureCause::MissingParameter => FaultCause::MissingMotorParams,
             CalibrationFailureCause::MotorParameterEstimation { fault } => fault.into(),
         }
@@ -48,8 +48,8 @@ impl From<CalibrationFailureCause> for FaultCause {
 pub enum Command {
     Idle,
     StartCalibration { num_pole_pairs: u8 },
-    FinishCalibration,
     FinishTuning,
+    FinishCalibration,
     EnableTorqueControl,
     EnableVelocityControl,
     AssertFault { cause: FaultCause },
@@ -57,6 +57,7 @@ pub enum Command {
 
 #[derive(Clone, Copy, defmt::Format)]
 pub enum CalibrationPhase {
+    EncoderZeroing { duration_waited_s: f32, reset_sent: bool },
     HallCalibration,
     MotorEstimation,
     MotorTuning,

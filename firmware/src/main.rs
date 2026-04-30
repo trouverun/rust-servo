@@ -15,20 +15,20 @@ pub mod pac {
 
 #[rtic::app(device = crate::pac, peripherals = false, dispatchers = [SPI2, SPI3])]
 mod app {
-    use core::ops::Not;
-
     use crate::boards::*;
     use crate::bsp::{
         self, Acceleration, AdcFeedback, AmtEncoder, HallFeedback, Memory,
         PwmOutput,
     };
+    use crate::calibration::StageResult;
     use crate::types::*;
     use crate::types::{BoardStatus, OperatingMode};
     use crate::utils::PhaseCurrentFilter;
     use crate::{
-        calibration::{CalibrationInputs, StageResult},
+        calibration::{CalibrationInputs},
         types::ButtonState,
     };
+    use core::ops::Not;
     use defmt::info;
     use defmt_rtt as _;
     use embassy_stm32::{peripherals::TIM2, rcc};
@@ -80,7 +80,7 @@ mod app {
         let mut adc_feedback = bsp::AdcFeedback::new(adc_mappings);
         adc_feedback.sample_sector(0); // Kick off the ADC ISR loop
         let mut hall_feedback = bsp::HallFeedback::new(hall_mappings, 1000.0);
-        let amt_encoder = bsp::AmtEncoder::new(25_000.0, 1000.0);
+        let amt_encoder = bsp::AmtEncoder::new(encoder_mappings, 25_000.0, 1000.0);
         let acceleration = bsp::Acceleration::new(accel_mappings);
         let memory = bsp::Memory::new(memory_mappings);
 
@@ -116,7 +116,7 @@ mod app {
 
         let token = rtic_monotonics::create_stm32_tim2_monotonic_token!();
         Mono::start(rcc::frequency::<TIM2>().0, token);
-        // absolute_encoder_task::spawn().unwrap();
+        debug_print::spawn().unwrap();
 
         (
             Shared {
@@ -180,18 +180,15 @@ mod app {
                 let mut rotor_feedback_fault = rotor_feedback.is_err();
                 // Rotor feedback being invalid is not an issue during hall calibration:
                 if let OperatingMode::Calibration { calibrator, .. } = mode {
-                    rotor_feedback_fault = rotor_feedback_fault && matches!(calibrator.phase, CalibrationPhase::HallCalibration).not();
+                    rotor_feedback_fault = rotor_feedback_fault && matches!(calibrator.phase, CalibrationPhase::EncoderZeroing {..} | CalibrationPhase::HallCalibration).not();
                 }
 
                 // Inactive or blocked from running, set idle outputs:
                 if !active || overcurrent || rotor_feedback_fault || dc_bus_reading.is_none() {
                     // TODO: need to come here also if:
                     // PI gains not configured
-                    // motor params not fully populated
                     cx.shared.pwm_output.lock(|pwm| {
-                        pwm.set_duty_cycles(PhaseValues {
-                            u: 0.5, v: 0.5, w: 0.5,
-                        })
+                        pwm.set_duty_cycles(PhaseValues::safe())
                     });
                 } else {
                     // During hall calibration there is no valid rotor feedback, but its not used so we can default to zero values:
@@ -246,9 +243,7 @@ mod app {
                                 voltage_hexagon_sector = result.voltage_hexagon_sector;
                             }
                             Err(fault) => {
-                                pwm.set_duty_cycles(PhaseValues {
-                                    u: 0.5, v: 0.5, w: 0.5,
-                                });
+                                pwm.set_duty_cycles(PhaseValues::safe());
                                 fault_command = Some(Command::AssertFault { cause: fault.into() })
                             }
                         });
@@ -261,12 +256,15 @@ mod app {
                     if calibration_result.is_some() {
                         cx.shared.foc.lock(|foc| {
                             match calibration_result {
+                                Some(StageResult::ZeroEncoderRequest) => {
+                                    let _ = reset_encoder::spawn();
+                                }
                                 Some(StageResult::HallCalibration { angle_table }) => {
                                     info!("Angle table {}", angle_table);
                                     cx.shared.hall_feedback.lock(|hf| hf.set_calibration(angle_table));
                                     foc.clear_windup();
                                 }
-                                Some(StageResult::ResetRequest) => {
+                                Some(StageResult::UnwindRequest) => {
                                     foc.clear_windup();
                                 }
                                 Some(StageResult::TuningRequest { params_estimate} ) => {
@@ -305,6 +303,26 @@ mod app {
         }
 
         // cx.shared.debug_mappings.lock(|dm| dm.la_pin.set_low());
+    }
+
+    #[task(priority = 1, shared = [amt_encoder])]
+    async fn reset_encoder(mut cx: reset_encoder::Context) {
+        cx.shared.amt_encoder.lock(|ae| {
+            ae.stop();
+        });
+        // After 100ms we can be sure there is no active dma request:
+        Mono::delay(100.millis()).await;
+
+        cx.shared.amt_encoder.lock(|ae| {
+            ae.send_reset_requests();
+        });
+
+        // After 250ms the encoder should be ready again:
+        Mono::delay(250.millis()).await;
+
+        cx.shared.amt_encoder.lock(|ae| {
+            ae.normal_mode();
+        });
     }
 
     #[task(priority = 1, shared = [mode, foc])]
@@ -359,16 +377,30 @@ mod app {
         });
     }
 
-    #[idle(shared=[amt_encoder, debug_mappings])]
-    fn idle(mut cx: idle::Context) -> ! {
+    #[task(binds = DMA1_CHANNEL4, shared=[amt_encoder], priority = 2)]
+    fn on_amt22_receive(mut cx: on_amt22_receive::Context) {
+        cx.shared.amt_encoder.lock(|ae| {
+            ae.on_transaction_complete();
+        });
+    }
+
+    #[task(shared=[amt_encoder], priority = 1)]
+    async fn debug_print(mut cx: debug_print::Context) {
         loop {
             cx.shared.amt_encoder.lock(|ae| {
                 let data = ae.read();
                 match data {
-                    Ok(values) => info!("Enc value: {}", values.theta),
-                    Err(..) => {}
+                    Ok(values) => { info!("Enc value: {}", values.theta); },
+                    Err(..) => { info!("Enc not OK"); }
                 }
             });
+            Mono::delay(100.millis()).await;
+        }
+    }
+
+    #[idle(shared=[amt_encoder, debug_mappings])]
+    fn idle(mut cx: idle::Context) -> ! {
+        loop {
             cortex_m::asm::wfi();
         }
     }

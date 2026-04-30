@@ -2,6 +2,8 @@ use crate::boards::*;
 use crate::types::FirmwareConfig;
 use crate::utils::{wrap_to_pi, LowPassFilter};
 use core::f32::consts::{PI, TAU};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use defmt::info;
 use embassy_stm32::adc::{
     Adc, AdcConfig, AnyAdcChannel, Dual, EocInterruptEnabled, Exten, ExternalTriggeredADC,
     JeosInterruptEnabled, Queued, Running as AdcRunning, SampleTime, StartMode,
@@ -9,15 +11,21 @@ use embassy_stm32::adc::{
 use embassy_stm32::cordic::utils::{f32_to_q1_15, q1_15_to_f32};
 use embassy_stm32::cordic::{Cordic, NoScale, Precision, Sin, Sqrt, SqrtScale, Q15};
 use embassy_stm32::flash::{Blocking as BlockingFlash, Flash};
+use embassy_stm32::gpio::Output;
 use embassy_stm32::pac::timer::vals::Bkp;
 use embassy_stm32::peripherals::CORDIC;
-use embassy_stm32::rcc::*;
+use embassy_stm32::{rcc::*};
+use embassy_stm32::spi::DmaDrivenSpi;
 use embassy_stm32::timer::hall::HallSensor;
 use embassy_stm32::timer::low_level::FilterValue;
 use embassy_stm32::timer::pwm::{Running as PwmRunning, PWM};
 use embassy_stm32::timer::trigger_output::BasicTrgoOutput;
 use embassy_stm32::timer::Channel;
+use embassy_stm32::dma::StreamingChannel;
 use embassy_stm32::Config as RccConfig;
+use embassy_stm32::timer::low_level::{RoundTo, Timer};
+use embassy_stm32::time::Hertz;
+use embassy_stm32::pac::gpio::regs::Bsrr;
 use field_oriented::{
     ControllerParameters, DoesFocMath, HasRotorFeedback, MotorParamsEstimate, PhaseValues,
     RotorFeedback, RotorFeedbackFault, SinCosResult,
@@ -717,7 +725,23 @@ impl Memory {
     pub fn write_controller_parameters(&self, params: ControllerParameters) {}
 }
 
+/// Where the Encoder SPI RX DMA channel circularly deposits the two response bytes
+static mut RX_BUF: [u8; 2] = [0xDE, 0xAD];
+
+/// AMT22 command bytes for the Encoder SPI TX DMA channels.
+/// 0x00, 0x00 = read position; 0x00, 0x60 = reset.
+static TX1_BYTE: AtomicU8 = AtomicU8::new(0x00);
+static TX2_BYTE: AtomicU8 = AtomicU8::new(0x00);
+
 pub struct AmtEncoder {
+    spi: DmaDrivenSpi<'static, EncoderSpi>,
+    _cs: Output<'static>,
+    _dma_timer: Timer<'static, EncoderDMATimer>,
+    _cs_low_channel: StreamingChannel,
+    _tx1_channel: StreamingChannel,
+    _tx2_channel: StreamingChannel,
+    rx_channel: StreamingChannel,
+    _cs_high_channel: StreamingChannel,
     theta: Option<f32>,
     omega: Option<f32>,
     omega_lowpass: LowPassFilter,
@@ -725,8 +749,85 @@ pub struct AmtEncoder {
 }
 
 impl AmtEncoder {
-    pub fn new(reading_frquency_hz: f32, lowpass_cutoff_hz: f32) -> Self {
+    pub fn new(
+        mappings: SPIEncoderMappings<EncoderSpi, EncoderDMATimer>, 
+        reading_frquency_hz: f32, lowpass_cutoff_hz: f32
+    ) -> Self {
+        let mut dma_timer = mappings.dma_timer;
+        // 10MHz tick rate = 0.01 us resolution:
+        dma_timer.set_tick_freq(Hertz(10_000_000));
+        // 100 us = 10kHz read rate
+        dma_timer.set_autoreload_value(1000 * 60); 
+        // 0.1 us -> dma request to set cs low
+        dma_timer.set_compare_value(Channel::Ch1, 1); 
+        dma_timer.set_cc_dma_enable_state(Channel::Ch1, true);
+        // 5 us -> dma request to fill spi tx buffer byte 1
+        dma_timer.set_compare_value(Channel::Ch2, 50); 
+        dma_timer.set_cc_dma_enable_state(Channel::Ch2, true);
+        // 15 us -> dma request to fill spi tx buffer byte 2
+        dma_timer.set_compare_value(Channel::Ch3, 150); 
+        dma_timer.set_cc_dma_enable_state(Channel::Ch3, true);
+        // 20 us -> (DMA RX complete ISR) and dma request to set cs high
+        dma_timer.set_compare_value(Channel::Ch4, 200);  
+        dma_timer.set_cc_dma_enable_state(Channel::Ch4, true);
+        dma_timer.generate_update_event();
+
+        let mut spi = mappings.spi;
+        let cs = mappings.cs;
+
+        // Create BSSR values for set and unset CS pin:
+        let bssr_reset = {
+            let mut b = Bsrr::default();
+            b.set_br(cs.pin() as usize, true);
+            b.0
+        };
+        let bssr_set = {
+            let mut b = Bsrr::default();
+            b.set_bs(cs.pin() as usize, true);
+            b.0
+        };
+        static CS_LOW: AtomicU32 = AtomicU32::new(0);
+        static CS_HIGH: AtomicU32 = AtomicU32::new(0);
+        CS_LOW.store(bssr_reset, Ordering::Relaxed);
+        CS_HIGH.store(bssr_set, Ordering::Relaxed);
+
+        // SAFETY: DMA not running yet
+        let cs_low: &'static u32 = unsafe { &*CS_LOW.as_ptr() };
+        let cs_high: &'static u32 = unsafe { &*CS_HIGH.as_ptr() };
+
+        // SAFETY: DMA not running yet
+        let rx_buf: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) };
+        let tx1_byte: &'static u8 = unsafe { &*TX1_BYTE.as_ptr() };
+        let tx2_byte: &'static u8 = unsafe { &*TX2_BYTE.as_ptr() };
+
+        let cs_low_channel = StreamingChannel::new_write_repeating(
+            mappings.cs_low_dma, mappings.cs_low_trigger, cs_low, cs.bsrr_dma_addr(), false
+        );
+        let tx1_channel = StreamingChannel::new_write_repeating(
+            mappings.tx1_dma, mappings.tx1_trigger, tx1_byte, spi.tx_addr(), false,
+        );
+        let tx2_channel = StreamingChannel::new_write_repeating(
+            mappings.tx2_dma, mappings.tx2_trigger, tx2_byte, spi.tx_addr(), false,
+        );
+        let rx_channel = StreamingChannel::new_read_circular(
+            mappings.rx_dma, mappings.rx_trigger, spi.rx_addr(), rx_buf, true,
+        );
+        let cs_high_channel = StreamingChannel::new_write_repeating(
+            mappings.cs_high_dma, mappings.cs_high_trigger, cs_high, cs.bsrr_dma_addr(), false
+        );
+
+        spi.start();
+        dma_timer.start();
+
         Self {
+            spi,
+            _cs: cs,
+            _dma_timer: dma_timer,
+            _cs_low_channel: cs_low_channel,
+            _tx1_channel: tx1_channel, 
+            _tx2_channel: tx2_channel, 
+            rx_channel,
+            _cs_high_channel: cs_high_channel,
             theta: None,
             omega: None,
             omega_lowpass: LowPassFilter::new(lowpass_cutoff_hz),
@@ -750,6 +851,64 @@ impl AmtEncoder {
         self.theta = None;
         self.omega = None;
     }
+
+    pub fn on_transaction_complete(&mut self) {
+        self.rx_channel.clear_complete_flag();
+
+        let (b0, b1) = unsafe {
+            (
+                core::ptr::read_volatile(core::ptr::addr_of!(RX_BUF[0])),
+                core::ptr::read_volatile(core::ptr::addr_of!(RX_BUF[1])),
+            )
+        };
+
+        let raw = (u16::from(b0) << 8) | u16::from(b1);
+
+        if amt22_checksum_ok(raw) {
+            self.update(raw & 0x3FFF);
+        } else {
+            self.invalidate();
+        }
+    }    
+    
+    pub fn stop(&mut self) {
+        self._dma_timer.stop();
+        self._dma_timer.reset();
+    }
+
+    /// Issue a single AMT22 reset command (0x00, 0x60) and halt the timer.
+    ///
+    /// Caller must wait >=200 ms before calling `normal_mode` to resume position polling.
+    pub fn send_reset_requests(&mut self) {
+        self.stop();
+        TX2_BYTE.store(0x60, Ordering::Relaxed);
+        self._dma_timer.set_one_pulse_mode(true);
+        self.start();
+    }
+
+    /// Restore continuous read-position polling after a reset.
+    pub fn normal_mode(&mut self) {
+        self.stop();
+        self._dma_timer.set_one_pulse_mode(false);
+        TX2_BYTE.store(0x00, Ordering::Relaxed);
+        self.start();
+    }
+
+    pub fn start(&mut self) {
+        self.invalidate();
+        self._dma_timer.start();
+    }
+}
+
+/// AMT22 checksum (datasheet page 2):
+///   K1 = !(D13^D11^D9^D7^D5^D3^D1)   parity over odd-indexed position bits
+///   K0 = !(D12^D10^D8^D6^D4^D2^D0)   parity over even-indexed position bits
+fn amt22_checksum_ok(raw: u16) -> bool {
+    let k1 = (raw >> 15) & 1;
+    let k0 = (raw >> 14) & 1;
+    let odd_parity  = (raw & 0x2AAA).count_ones() as u16 & 1;
+    let even_parity = (raw & 0x1555).count_ones() as u16 & 1;
+    k1 != odd_parity && k0 != even_parity
 }
 
 impl HasRotorFeedback for AmtEncoder {
@@ -757,7 +916,7 @@ impl HasRotorFeedback for AmtEncoder {
         if let (Some(theta), Some(omega)) = (self.theta, self.omega) {
             Ok(RotorFeedback { theta, omega })
         } else {
-            Err(RotorFeedbackFault::NoResponse)
+            Err(RotorFeedbackFault::ErroneusValue)
         }
     }
 }

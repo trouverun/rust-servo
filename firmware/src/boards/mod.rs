@@ -1,29 +1,35 @@
+#[cfg(feature = "board-zest1")]
+mod zest1;
+#[cfg(feature = "spi-encoder")]
+use embassy_stm32::timer::GeneralInstance4Channel;
+#[cfg(feature = "board-zest1")]
+pub use zest1::*;
+
+#[cfg(feature = "spi-encoder")]
+pub mod spi_encoder;
+#[cfg(feature = "spi-encoder")]
+pub use spi_encoder::*;
+
 use embassy_stm32::adc::AnyAdcChannel;
 use embassy_stm32::comp::Comp;
 use embassy_stm32::dac::{Dac, DacChannel};
 #[cfg(feature = "spi-encoder")]
 use embassy_stm32::gpio::Output;
-#[cfg(feature = "rs485-encoder")]
-use embassy_stm32::mode::Async;
 use embassy_stm32::mode::Blocking;
 #[cfg(feature = "mcu-opamps")]
 use embassy_stm32::opamp::OpAmpOutput;
 use embassy_stm32::peripherals::{CORDIC, FLASH};
 #[cfg(feature = "spi-encoder")]
-use embassy_stm32::spi::{mode::Master, Spi};
+use embassy_stm32::spi::{DmaDrivenSpi, Instance};
+#[cfg(feature = "spi-encoder")]
+use embassy_stm32::dma::{Channel, DmaRequestSource};
 use embassy_stm32::time::Hertz;
 #[cfg(feature = "hall-feedback")]
 use embassy_stm32::timer::hall::HallSensor;
 use embassy_stm32::timer::pwm::{NotRunning, PwmDeadtime, PWM};
 use embassy_stm32::timer::{trigger_output::BasicTrgoOutput, CountingMode};
-#[cfg(feature = "rs485-encoder")]
-use embassy_stm32::usart::Uart;
+use embassy_stm32::timer::low_level::Timer;
 use embassy_stm32::Peri;
-
-#[cfg(feature = "board-zest1")]
-mod zest1;
-#[cfg(feature = "board-zest1")]
-pub use zest1::*;
 
 pub const PWM_FREQ: Hertz = Hertz(20_000);
 pub const COUNTING_MODE: CountingMode = CountingMode::CenterAlignedBothInterrupts;
@@ -66,9 +72,20 @@ pub struct HallFeedbackMappings {
 }
 
 #[cfg(feature = "spi-encoder")]
-pub struct SPIEncoderMappings {
-    pub spi: Spi<'static, Blocking, Master>,
+pub struct SPIEncoderMappings<A: Instance, B: GeneralInstance4Channel> {
+    pub spi: DmaDrivenSpi<'static, A>,
     pub cs: Output<'static>,
+    pub dma_timer: Timer<'static, B>,
+    pub cs_low_trigger: DmaRequestSource,
+    pub tx1_trigger: DmaRequestSource,
+    pub tx2_trigger: DmaRequestSource,
+    pub rx_trigger: DmaRequestSource,
+    pub cs_high_trigger: DmaRequestSource,
+    pub cs_low_dma: Channel<'static>,
+    pub tx1_dma: Channel<'static>,
+    pub tx2_dma: Channel<'static>,
+    pub rx_dma: Channel<'static>,
+    pub cs_high_dma: Channel<'static>
 }
 
 #[cfg(feature = "overcurrent-comparators")]

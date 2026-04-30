@@ -25,12 +25,14 @@ pub struct CalibrationOutput {
 pub enum CalibrationFailureCause {
     MissingParameter,
     MotorParameterEstimation { fault: EstimationStepFault },
+    Timeout
 }
 
 /// Stage specific outputs / results
 pub enum StageResult {
+    ZeroEncoderRequest,
     HallCalibration { angle_table: [f32; 6] },
-    ResetRequest,
+    UnwindRequest,
     TuningRequest { params_estimate: MotorParamsEstimate },
     MotorParameters { motor_params: MotorParamsEstimate },
     Failure { cause: CalibrationFailureCause },
@@ -51,17 +53,39 @@ impl CalibrationRunner {
             num_pole_pairs,
             hall_calibrator,
             motor_estimator,
-            phase: CalibrationPhase::HallCalibration,
+            phase: CalibrationPhase::EncoderZeroing { duration_waited_s: 0.0, reset_sent: false },
         }
     }
 
     pub fn start(&mut self) {
-        self.phase = CalibrationPhase::HallCalibration;
-        self.hall_calibrator.start();
+        self.phase = CalibrationPhase::EncoderZeroing { duration_waited_s: 0.0, reset_sent: false };
+        
     }
 
     pub fn step(&mut self, inputs: CalibrationInputs) -> (CalibrationOutput, Option<StageResult>) {
-        match self.phase {
+        match &mut self.phase {
+            CalibrationPhase::EncoderZeroing { duration_waited_s, reset_sent } => {
+                const DT: f32 = 1.0 / PWM_FREQ.0 as f32;
+                *duration_waited_s += DT;
+                let mut result = None;
+                let output = CalibrationOutput {
+                    theta: 0.0,
+                    foc_command: FocInputType::CalibrationCurrents(ClarkParkValue {
+                        d: inputs.target_current,
+                        q: 0.0,
+                    }),
+                };
+                if *duration_waited_s < 4.0 {
+                    if *duration_waited_s >= 3.0 && !*reset_sent {
+                        result = Some(StageResult::ZeroEncoderRequest);
+                        *reset_sent = true;
+                    }
+                } else {
+                    self.phase = CalibrationPhase::HallCalibration;
+                    self.hall_calibrator.start();
+                }
+                (output, result)
+            }
             CalibrationPhase::HallCalibration => {
                 if self.hall_calibrator.check_calibration_done() {
                     let result = StageResult::HallCalibration {
@@ -89,7 +113,7 @@ impl CalibrationRunner {
             CalibrationPhase::MotorEstimation => {
                 if self.motor_estimator.should_reset_controller() {
                     let output = self.idle_output(inputs);
-                    (output, Some(StageResult::ResetRequest))
+                    (output, Some(StageResult::UnwindRequest))
                 } else if self.motor_estimator.should_tune_controller() {
                     let output = self.idle_output(inputs);
                     (output, Some(StageResult::TuningRequest { params_estimate: self.motor_estimator.get_estimate() } ))
