@@ -3,6 +3,9 @@ use embassy_stm32::adc::{
     AnyAdcChannel, EocInterruptEnabled, Exten, ExternalTriggeredADC, JeosInterruptEnabled,
     NotQueued, Resolution, Running, SampleTime,
 };
+
+use embassy_stm32::{rcc::*};
+use embassy_stm32::Config as RccConfig;
 use embassy_stm32::timer::low_level::Timer;
 use embassy_stm32::{comp::*};
 use embassy_stm32::dac::Ch2;
@@ -14,7 +17,7 @@ use embassy_stm32::opamp::{OpAmp, OpAmpSpeed};
 use embassy_stm32::pac::timer::vals::{Bkinp, Bkp};
 use embassy_stm32::peripherals::{
     ADC1, ADC3, ADC4, COMP4, COMP6, COMP7, DAC3, DAC4, FDCAN1, OPAMP3, OPAMP4, OPAMP5, TIM3, TIM4,
-    TIM6, TIM8, SPI1, DAC1, DAC2, TIM5
+    TIM6, TIM8, SPI1, DAC1, DAC2, TIM5, TIM7
 };
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::hall::{Config as HallConfig, HallSensor};
@@ -58,11 +61,14 @@ pub type ComparatorDacChannel = Ch2;
 pub type ComparatorDacDual = DAC4;
 pub type PwmTimer = TIM8;
 
+// Watchdog
+pub type WatchdogTimer = TIM7;
+
 pub const BOARD: super::BoardInfo = super::BoardInfo {
     shunt_resistance_mohm: 15.0,
     opamp_gain: 15.0,
     vbus_divide_factor: 25.3589743589744,
-    thermistor_scaling: super::TherimistorLinearScale {
+    thermistor_scaling: super::ThermistorLinearScale {
         slope: 45.7,
         bias: 23.6,
     },
@@ -78,9 +84,29 @@ pub struct DebugMappings {
     pub la_d: Output<'static>
 }
 
-pub fn map_peripherals(
-    p: embassy_stm32::Peripherals,
-) -> (
+fn rcc_init() -> embassy_stm32::Peripherals {
+    // Configure sysclk (to 170MHz)
+    let mut rcc_config = RccConfig::default();
+    rcc_config.rcc.hsi = true;
+    rcc_config.rcc.pll = Some(Pll {
+        source: PllSource::HSI,
+        prediv: PllPreDiv::DIV4,
+        mul: PllMul::MUL85,
+        divr: Some(PllRDiv::DIV2),
+        divq: Some(PllQDiv::DIV4),
+        divp: Some(PllPDiv::DIV8),
+    });
+    rcc_config.rcc.sys = Sysclk::PLL1_R;
+    rcc_config.rcc.ahb_pre = AHBPrescaler::DIV1;
+    rcc_config.rcc.apb1_pre = APBPrescaler::DIV1;
+    rcc_config.rcc.apb2_pre = APBPrescaler::DIV1;
+    rcc_config.rcc.mux.adc12sel = mux::Adcsel::PLL1_P;
+    rcc_config.rcc.mux.adc345sel = mux::Adcsel::PLL1_P;
+    rcc_config.rcc.mux.fdcansel = mux::Fdcansel::PLL1_Q;
+    embassy_stm32::init(rcc_config)
+}
+
+pub fn map_peripherals() -> (
     super::AdcFeedbackMappings,
     super::HallFeedbackMappings,
     super::SPIEncoderMappings<EncoderSpi, EncoderDMATimer>,
@@ -88,8 +114,10 @@ pub fn map_peripherals(
     super::AccelerationMappings,
     super::MemoryMappings,
     super::CanMappings,
+    super::WatchdogMappings,
     DebugMappings,
 ) {
+    let p = rcc_init();
     let adc_feedback = super::AdcFeedbackMappings {
         opamps: super::ShuntOpAmps {
             u: OpAmp::new(p.OPAMP3, OpAmpSpeed::HighSpeed).standalone_ext(p.PB0, p.PB2, p.PB1),
@@ -189,6 +217,10 @@ pub fn map_peripherals(
         la_d: Output::new(p.PE5, Level::Low, Speed::Low)
     };
 
+    let watchdog = super::WatchdogMappings {
+        timer: Timer::new(p.TIM7)
+    };
+
     (
         adc_feedback,
         hall_feedback,
@@ -197,6 +229,7 @@ pub fn map_peripherals(
         acceleration,
         storage,
         can,
+        watchdog,
         debug,
     )
 }

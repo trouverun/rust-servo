@@ -19,7 +19,7 @@ mod app {
     use crate::boards::*;
     use crate::bsp::{
         self, Acceleration, AdcFeedback, AmtEncoder, CanBus, HallFeedback, Memory,
-        PwmOutput,
+        PwmOutput, Watchdog
     };
     use crate::calibration::StageResult;
     use crate::types::{CalibrationPhase, *};
@@ -40,7 +40,9 @@ use core::ops::Not;
     use embassy_stm32::interrupt::typelevel::Handler;
     use embassy_stm32::{peripherals::TIM2, rcc};
     use field_oriented::{
-        AngleType, ConstantMotorParameters, FOC, FocConfig, FocInput, FocInputType, HasRotorFeedback, MotorParamEstimator, MotorParamsEstimate, PhaseValues, RotorFeedback, compute_current_pi_controller_gains
+        AngleType, ConstantMotorParameters, FOC, FocConfig, FocInput, FocInputType, 
+        HasRotorFeedback, MotorParamEstimator, MotorParamsEstimate, PhaseValues, RotorFeedback, 
+        compute_current_pi_controller_gains
     };
     use rtic_monotonics::stm32::{ExtU64, Tim2 as Mono};
     use rtic_monotonics::Monotonic;
@@ -61,6 +63,7 @@ use core::ops::Not;
         button_state: ButtonState,
         current_loop_snapshot: CurrentLoopSnapshot,
         feedback_arbitrator: FeedbackArbitrator,
+        watchdog: Watchdog,
     }
 
     #[local]
@@ -75,7 +78,6 @@ use core::ops::Not;
 
     #[init]
     fn init(_cx: init::Context) -> (Shared, Local) {
-        let p = bsp::init();
         let (
             adc_mappings,
             hall_mappings,
@@ -84,8 +86,9 @@ use core::ops::Not;
             accel_mappings,
             memory_mappings,
             can_mappings,
+            watchdog_mappings,
             debug_mappings,
-        ) = map_peripherals(p);
+        ) = map_peripherals();
 
         let pwm_output = bsp::PwmOutput::new(pwm_mappings);
         pwm_output.wait_break2_ready(); // Shows active low for first N cycles, wait it out
@@ -153,7 +156,8 @@ use core::ops::Not;
             debug_mappings,
             button_state: ButtonState::Waiting,
             current_loop_snapshot: CurrentLoopSnapshot::default(),
-            feedback_arbitrator: FeedbackArbitrator::new()
+            feedback_arbitrator: FeedbackArbitrator::new(),
+            watchdog: Watchdog::new(watchdog_mappings)
         },
         Local {
             adc_feedback,
@@ -165,13 +169,21 @@ use core::ops::Not;
         })
     }
 
+    #[task(priority = 4, binds = TIM7_DAC, shared = [watchdog, mode])]
+    fn watchdog_isr(mut cx: watchdog_isr::Context) {
+        cx.shared.watchdog.lock(|wd| wd.acknowledge_fault());
+        cx.shared.mode.lock(|mode| {
+            mode.on_command(Command::AssertFault { cause: FaultCause::Watchdog });
+        });
+    }
+
     #[task(
         priority = 3, binds = ADC3,
         local = [adc_feedback, current_filter, acceleration],
         shared = [
             pwm_output, foc, motor_parameters, feedback_arbitrator,
             mode, board_status, config, runtime_values, debug_mappings,
-            current_loop_snapshot
+            current_loop_snapshot, watchdog
         ]
     )]
     fn currents_adc_isr(mut cx: currents_adc_isr::Context) {
@@ -192,6 +204,7 @@ use core::ops::Not;
 
             // if FOC ISR (sampled phase currents):
             if let Some(phase_currents) = cx.local.adc_feedback.read_currents() {
+                cx.shared.watchdog.lock(|wd| wd.feed());
                 // Check for overcurrent:
                 cx.local.current_filter.update(phase_currents);
                 let overcurrent = cx.local.current_filter.check_overcurrent();
@@ -207,9 +220,10 @@ use core::ops::Not;
                 });
 
                 let mut rotor_feedback_fault = rotor_feedback.is_err();
-                // Rotor feedback being invalid is not an issue during hall calibration:
+                // Rotor feedback being invalid is not an issue during encoder zeroing or hall calibration:
                 if let OperatingMode::Calibration { calibrator, .. } = mode {
-                    rotor_feedback_fault = rotor_feedback_fault && matches!(calibrator.phase, CalibrationPhase::EncoderZeroing {..} | CalibrationPhase::HallCalibration).not();
+                    let invalid_ok = matches!(calibrator.phase, CalibrationPhase::EncoderZeroing {..} | CalibrationPhase::HallCalibration {..});
+                    rotor_feedback_fault = rotor_feedback_fault && !invalid_ok;
                 }
 
                 // Inactive or blocked from running, set idle outputs:
@@ -220,8 +234,8 @@ use core::ops::Not;
                         pwm.set_duty_cycles(PhaseValues::safe())
                     });
                 } else {
-                    // During hall calibration there is no valid rotor feedback, 
-                    // but it is not used, so we can safely default to zero values:
+                    // During encoder zeroing or hall calibration there may be no valid rotor feedback, 
+                    // but feedback is not used anyways, so we can safely default to zero values:
                     let RotorFeedback { angle_type, theta, omega } = rotor_feedback.ok()
                         .unwrap_or(RotorFeedback { angle_type: AngleType::Electrical, theta: 0.0, omega: 0.0 });
                     let dc_bus_voltage = dc_bus_reading.expect("Already checked for None above");
@@ -367,7 +381,7 @@ use core::ops::Not;
         let result = compute_current_pi_controller_gains::<50>(estimate, PWM_FREQ.0 as f32);
         info!("PI gains {}", result);
         match result {
-            Some(pi_gains) => {
+            Ok(pi_gains) => {
                 cx.shared.foc.lock(|foc| {
                     foc.set_pi_gains(pi_gains);
                     foc.clear_windup();
@@ -376,10 +390,10 @@ use core::ops::Not;
                     mode.on_command(Command::ResumeCalibration);
                 });
             }
-            None => {
+            Err(fault) => {
                 cx.shared.mode.lock(|mode| {
                     mode.on_command(Command::AssertFault {
-                        cause: FaultCause::ControllerTuningFail,
+                        cause: fault.into(),
                     });
                 });
             }
@@ -555,13 +569,13 @@ use core::ops::Not;
     #[task(priority = 1, shared=[feedback_arbitrator])]
     async fn debug_print(mut cx: debug_print::Context) {
         loop {
-            let data = cx.shared.feedback_arbitrator.lock(|fa| {
+            /*let data = cx.shared.feedback_arbitrator.lock(|fa| {
                 fa.read()
             });
 
             if let Ok(vals) = data {
                 info!("Angle: {}, Omega {}", vals.theta, vals.omega);
-            } 
+            } */
             Mono::delay(100.millis()).await;
         }
     }

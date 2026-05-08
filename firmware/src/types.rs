@@ -1,5 +1,5 @@
 use crate::calibration::CalibrationFailureCause;
-use field_oriented::{EstimationStepFault, FocFault, HallCalibrator, OfflineMotorEstimator};
+use field_oriented::{EstimationStepFault, FocFault, HallCalibrator, OfflineMotorEstimator, PITuningFault};
 use defmt::{Format, Formatter, write, info};
 
 #[derive(Clone, Copy, defmt::Format)]
@@ -8,9 +8,10 @@ pub enum FaultCause {
     Overcurrent,
     Break1,
     Break2,
+    Watchdog,
     CalibrationTimeout,
-    EstimationFail,
-    ControllerTuningFail,
+    EstimationFail { cause: EstimationStepFault },
+    ControllerTuningFail { cause: PITuningFault },
     MissingMotorParams,
 }
 
@@ -26,10 +27,10 @@ impl From<EstimationStepFault> for FaultCause {
     fn from(f: EstimationStepFault) -> Self {
         match f {
             EstimationStepFault::MissingParameter => FaultCause::MissingMotorParams,
-            EstimationStepFault::Overflow
+            (EstimationStepFault::Overflow
             | EstimationStepFault::InsufficientSamples
             | EstimationStepFault::DegenSolution
-            | EstimationStepFault::ParameterOutOfBounds => FaultCause::EstimationFail,
+            | EstimationStepFault::ParameterOutOfBounds) => FaultCause::EstimationFail { cause: f },
         }
     }
 }
@@ -41,6 +42,12 @@ impl From<CalibrationFailureCause> for FaultCause {
             CalibrationFailureCause::MissingParameter => FaultCause::MissingMotorParams,
             CalibrationFailureCause::MotorParameterEstimation { fault } => fault.into(),
         }
+    }
+}
+
+impl From<PITuningFault> for FaultCause {
+    fn from(f: PITuningFault) -> Self {
+        FaultCause::ControllerTuningFail { cause: f }
     }
 }
 
@@ -58,7 +65,7 @@ pub enum Command {
 #[derive(Clone, Copy, defmt::Format)]
 pub enum CalibrationPhase {
     EncoderZeroing { duration_waited_s: f32, reset_sent: bool },
-    HallCalibration,
+    HallCalibration { time_passed_s: f32 },
     MotorEstimation,
     WaitingHallCompletion,
     WaitingTuning,

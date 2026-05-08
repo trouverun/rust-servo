@@ -1,6 +1,5 @@
 use crate::boards::PWM_FREQ;
 use crate::types::{CalibrationPhase, CalibrationRunner};
-use defmt::info;
 use field_oriented::{
     ClarkParkValue, EstimationStepFault, FocInputType, HallCalibrator, MotorParamEstimator,
     MotorParamsEstimate, OfflineEstimatorConfig, OfflineEstimatorInput, OfflineEstimatorOutput,
@@ -39,6 +38,7 @@ pub enum StageResult {
     Failure { cause: CalibrationFailureCause },
 }
 
+const DT: f32 = 1.0 / PWM_FREQ.0 as f32;
 impl CalibrationRunner {
     pub fn new(num_pole_pairs: u8) -> Self {
         let hall_calibrator = HallCalibrator::new(3.0);
@@ -66,7 +66,6 @@ impl CalibrationRunner {
     pub fn step(&mut self, inputs: CalibrationInputs) -> (CalibrationOutput, Option<StageResult>) {
         match &mut self.phase {
             CalibrationPhase::EncoderZeroing { duration_waited_s, reset_sent } => {
-                const DT: f32 = 1.0 / PWM_FREQ.0 as f32;
                 *duration_waited_s += DT;
                 let mut result = None;
                 let output = CalibrationOutput {
@@ -82,13 +81,18 @@ impl CalibrationRunner {
                         *reset_sent = true;
                     }
                 } else {
-                    self.phase = CalibrationPhase::HallCalibration;
+                    self.phase = CalibrationPhase::HallCalibration { time_passed_s: 0.0 };
                     self.hall_calibrator.start();
                 }
                 (output, result)
             }
-            CalibrationPhase::HallCalibration => {
-                if self.hall_calibrator.check_calibration_done() {
+            CalibrationPhase::HallCalibration { time_passed_s } => {
+                *time_passed_s += DT;
+                if *time_passed_s > 15.0 {
+                    let result = StageResult::Failure { cause: CalibrationFailureCause::Timeout };
+                    let output = self.idle_output(inputs);
+                    (output, Some(result))
+                } else if self.hall_calibrator.check_calibration_done() {
                     let result = StageResult::HallCalibration {
                         angle_table: self.hall_calibrator.hall_pattern_to_theta,
                     };

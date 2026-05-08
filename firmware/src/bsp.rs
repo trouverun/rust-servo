@@ -3,7 +3,6 @@ use crate::types::FirmwareConfig;
 use crate::utils::{wrap_to_pi, LowPassFilter};
 use core::f32::consts::{PI, TAU};
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
-use defmt::info;
 use embassy_stm32::adc::{
     Adc, AdcConfig, AnyAdcChannel, Dual, EocInterruptEnabled, Exten, ExternalTriggeredADC,
     JeosInterruptEnabled, Queued, Running as AdcRunning, SampleTime, StartMode,
@@ -18,7 +17,6 @@ use embassy_stm32::flash::{Blocking as BlockingFlash, Flash};
 use embassy_stm32::gpio::Output;
 use embassy_stm32::pac::timer::vals::Bkp;
 use embassy_stm32::peripherals::CORDIC;
-use embassy_stm32::{rcc::*};
 use embassy_stm32::spi::DmaDrivenSpi;
 use embassy_stm32::timer::hall::HallSensor;
 use embassy_stm32::timer::low_level::FilterValue;
@@ -26,7 +24,6 @@ use embassy_stm32::timer::pwm::{Running as PwmRunning, PWM};
 use embassy_stm32::timer::trigger_output::BasicTrgoOutput;
 use embassy_stm32::timer::Channel;
 use embassy_stm32::dma::StreamingChannel;
-use embassy_stm32::Config as RccConfig;
 use embassy_stm32::timer::low_level::{Timer};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::pac::gpio::regs::Bsrr;
@@ -42,28 +39,6 @@ const ADC_SCALER: f32 = ADC_VOLTAGE / ((1 << 12) - 1) as f32;
 const CURRENT_READING_SCALER: f32 = -ADC_SCALER * OPAMP_GAIN_RECIPROCAL * SHUNT_CONDUCTANCE_SIEMENS;
 const VBUS_READING_SCLAER: f32 = ADC_SCALER * BOARD.vbus_divide_factor;
 const TBOARD_READING_SCLAER: f32 = ADC_SCALER * BOARD.thermistor_scaling.slope;
-
-pub fn init() -> embassy_stm32::Peripherals {
-    // Configure sysclk (to 170MHz)
-    let mut rcc_config = RccConfig::default();
-    rcc_config.rcc.hsi = true;
-    rcc_config.rcc.pll = Some(Pll {
-        source: PllSource::HSI,
-        prediv: PllPreDiv::DIV4,
-        mul: PllMul::MUL85,
-        divr: Some(PllRDiv::DIV2),
-        divq: Some(PllQDiv::DIV4),
-        divp: Some(PllPDiv::DIV8),
-    });
-    rcc_config.rcc.sys = Sysclk::PLL1_R;
-    rcc_config.rcc.ahb_pre = AHBPrescaler::DIV1;
-    rcc_config.rcc.apb1_pre = APBPrescaler::DIV1;
-    rcc_config.rcc.apb2_pre = APBPrescaler::DIV1;
-    rcc_config.rcc.mux.adc12sel = mux::Adcsel::PLL1_P;
-    rcc_config.rcc.mux.adc345sel = mux::Adcsel::PLL1_P;
-    rcc_config.rcc.mux.fdcansel = mux::Fdcansel::PLL1_Q;
-    embassy_stm32::init(rcc_config)
-}
 
 pub type BusVoltage = f32;
 pub type BoardTemperature = f32;
@@ -494,8 +469,6 @@ impl HasRotorFeedback for HallFeedback {
         // Todo: return Result so caller can deal with invalid patterns 000 and 111
 
         // Return fault if this has not been calibrated yet:
-
-        use field_oriented::AngleType;
         let hall_pattern_to_theta = self.hall_pattern_to_theta.ok_or(RotorFeedbackFault::NotCalibrated)?;
         let forward_next = self.forward_next.ok_or(RotorFeedbackFault::NotCalibrated)?;
         let sector_span = self.sector_span.ok_or(RotorFeedbackFault::NotCalibrated)?;
@@ -943,5 +916,41 @@ impl HasRotorFeedback for AmtEncoder {
         } else {
             Err(RotorFeedbackFault::ErroneusValue)
         }
+    }
+}
+
+pub struct Watchdog {
+    timer: Timer<'static, WatchdogTimer>,
+    faulted: bool
+}
+
+impl Watchdog {
+    pub fn new(mappings: WatchdogMappings) -> Self {
+        let timer = mappings.timer;
+        timer.set_frequency(Hertz((0.9*PWM_FREQ.0 as f32) as u32), embassy_stm32::timer::low_level::RoundTo::Slower);
+        timer.enable_update_interrupt(true);
+        timer.generate_update_event();
+        timer.start();
+        Self { timer, faulted: false }
+    }
+
+    pub fn acknowledge_fault(&mut self) {
+        self.timer.clear_update_interrupt();
+        self.timer.stop();
+        self.faulted = true;
+    }
+
+    pub fn is_faulted(&self) -> bool {
+        self.faulted
+    }
+
+    pub fn start(&mut self) {
+        self.faulted = false;
+        self.timer.reset();
+        self.timer.start();
+    }
+
+    pub fn feed(&self) {
+        self.timer.reset();
     }
 }

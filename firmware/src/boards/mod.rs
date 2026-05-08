@@ -35,7 +35,7 @@ use embassy_stm32::Peri;
 pub const PWM_FREQ: Hertz = Hertz(20_000);
 pub const COUNTING_MODE: CountingMode = CountingMode::CenterAlignedBothInterrupts;
 
-pub struct TherimistorLinearScale {
+pub struct ThermistorLinearScale {
     pub slope: f32,
     pub bias: f32,
 }
@@ -44,7 +44,7 @@ pub struct BoardInfo {
     pub shunt_resistance_mohm: f32,
     pub opamp_gain: f32,
     pub vbus_divide_factor: f32,
-    pub thermistor_scaling: TherimistorLinearScale,
+    pub thermistor_scaling: ThermistorLinearScale,
 }
 
 #[cfg(feature = "mcu-opamps")]
@@ -116,4 +116,8 @@ pub struct MemoryMappings {
 
 pub struct CanMappings {
     pub configurator: CanConfigurator<'static>,
+}
+
+pub struct WatchdogMappings {
+    pub timer: Timer<'static, WatchdogTimer>
 }
