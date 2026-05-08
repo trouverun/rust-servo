@@ -1,10 +1,19 @@
+#[derive(Clone, Copy)]
+pub enum AngleType {
+    Mechanical,
+    Electrical,
+}
+
+#[derive(Clone, Copy)]
 pub enum RotorFeedbackFault {
     NotCalibrated,
     NoResponse,
     ErroneusValue
 }
 
+#[derive(Clone, Copy)]
 pub struct RotorFeedback {
+    pub angle_type: AngleType,
     pub theta: f32,
     pub omega: f32
 }
@@ -42,6 +51,12 @@ pub struct PhaseValues {
     pub w: f32
 }
 
+impl PhaseValues {
+    pub fn safe() -> PhaseValues {
+        PhaseValues { u: 0.0, v: 0.0, w: 0.0 }
+    }
+}
+
 pub struct FocConfig {
     pub saturation_d_ratio: f32,
 }
@@ -53,12 +68,6 @@ pub enum FocInputType {
     CalibrationCurrents(ClarkParkValue),
     TargetCurrents(ClarkParkValue),
     TargetTorque(TorqueNm),
-}
-
-#[derive(Clone, Copy)]
-pub enum AngleType {
-    Mechanical,
-    Electrical,
 }
 
 #[derive(Clone, Copy)]

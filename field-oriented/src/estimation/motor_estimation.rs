@@ -146,15 +146,8 @@ impl OfflineEstimatorState {
                 }
             }
             Self::TuningRequired { resistance } => {
-                let result = Some(StepResult::Transition(
-                    Self::EstF {
-                        ran_s: 0.0,
-                        latched_i_q: None,
-                        resistance: *resistance,
-                        lse: Lse::new(),
-                    },
-                ));
-                Ok(result)
+                // Transition happens through acknowledgement of tuning request
+                Ok(None)
             }
             Self::EstF {
                 ran_s, latched_i_q, resistance, lse
@@ -234,7 +227,7 @@ pub struct OfflineMotorEstimator {
     state: OfflineEstimatorState,
     pub params: MotorParamsEstimate,
     config: OfflineEstimatorConfig,
-    should_reset_controller: bool
+    should_unwind_controller: bool
 }
 
 impl OfflineMotorEstimator {
@@ -245,20 +238,20 @@ impl OfflineMotorEstimator {
             state: OfflineEstimatorState::Off,
             params,
             config,
-            should_reset_controller: false
+            should_unwind_controller: false
         }
     }
 
     pub fn reset(&mut self) {
         self.state = OfflineEstimatorState::Off;
         self.params = MotorParamsEstimate::new_empty();
-        self.should_reset_controller = false;
+        self.should_unwind_controller = false;
     }
 
     pub fn start(&mut self, num_pole_pairs: u8) {
         self.params.num_pole_pairs = Some(num_pole_pairs);
         self.state = OfflineEstimatorState::RotorLockWait { waited_s: 0.0 };
-        self.should_reset_controller = false;
+        self.should_unwind_controller = false;
     }
 
     /// Returns the command for the current state.
@@ -315,12 +308,27 @@ impl OfflineMotorEstimator {
         matches!(self.state, OfflineEstimatorState::Failure { .. })
     }
 
-    pub fn should_reset_controller(&self) -> bool {
-        self.should_reset_controller
+    pub fn should_unwind_controller(&self) -> bool {
+        self.should_unwind_controller
     }
 
     pub fn should_tune_controller(&self) -> bool {
         matches!(self.state, OfflineEstimatorState::TuningRequired { .. })
+    }
+
+    pub fn acnkowledge_unwind_request(&mut self) {
+        self.should_unwind_controller = false;
+    }
+
+    pub fn acknowledge_tuning_request(&mut self) {
+        if let OfflineEstimatorState::TuningRequired { resistance } = self.state {
+            self.state = OfflineEstimatorState::EstF {
+                ran_s: 0.0,
+                latched_i_q: None,
+                resistance,
+                lse: Lse::new(),
+            }
+        }
     }
 
     pub fn get_fault(&self) -> Option<EstimationStepFault> {
@@ -334,8 +342,6 @@ impl OfflineMotorEstimator {
 
 impl MotorParamEstimator for OfflineMotorEstimator {
     fn after_foc_iteration(&mut self, data: FocResult) {
-        self.should_reset_controller = false;
-
         if self.params.num_pole_pairs.is_none() {
             self.state = OfflineEstimatorState::Failure { fault: EstimationStepFault::MissingParameter }
         }
@@ -343,7 +349,7 @@ impl MotorParamEstimator for OfflineMotorEstimator {
         match self.state.step(&data, &self.config, data.omega_e, self.params.num_pole_pairs.unwrap_or(1)) {
             Err(fault) => {
                 self.state = OfflineEstimatorState::Failure { fault };
-                self.should_reset_controller = true;
+                self.should_unwind_controller = true;
             }
             Ok(Some(result)) => {
                 match result {
@@ -353,7 +359,7 @@ impl MotorParamEstimator for OfflineMotorEstimator {
                     StepResult::EstimateR { resistance, next } => {
                         self.params.stator_resistance = Some(resistance);
                         self.state = next;
-                        self.should_reset_controller = true;
+                        self.should_unwind_controller = true;
                     }
                     StepResult::EstimateL { d_inductance, next } => {
                         self.params.d_inductance = Some(d_inductance);
@@ -366,7 +372,7 @@ impl MotorParamEstimator for OfflineMotorEstimator {
                     StepResult::RampDown { pm_flux_linkage } => { 
                         self.params.pm_flux_linkage = pm_flux_linkage;
                         self.state = OfflineEstimatorState::Done; 
-                        self.should_reset_controller = true;
+                        self.should_unwind_controller = true;
                     }
                 }
             }
@@ -442,13 +448,15 @@ mod test {
             let foc_result = foc.compute(foc_input, estimator.get_estimate(), &mut accelerator);
             estimator.after_foc_iteration(foc_result.unwrap());
 
-            if estimator.should_reset_controller() {
+            if estimator.should_unwind_controller() {
                 foc.clear_windup();
+                estimator.acnkowledge_unwind_request();
             }else if estimator.should_tune_controller() {
                 let pi_gains = compute_current_pi_controller_gains::<50>(
                     estimator.get_estimate(), pwm_freq_hz
                 ).expect("Failed to tune PI controller");
                 foc.set_pi_gains(pi_gains);
+                estimator.acknowledge_tuning_request();
             }
 
             state = sim.step(foc_result.unwrap());
