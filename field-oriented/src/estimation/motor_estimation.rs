@@ -145,7 +145,7 @@ impl OfflineEstimatorState {
                     Ok(None)
                 }
             }
-            Self::TuningRequired { resistance } => {
+            Self::TuningRequired { .. } => {
                 // Transition happens through acknowledgement of tuning request
                 Ok(None)
             }

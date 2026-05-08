@@ -13,8 +13,8 @@ mod pi_control;
 mod estimation;
 
 pub use crate::types::*;
-use crate::{math::*, pi_control::PIGains};
-pub use crate::pi_control::{PIController, compute_current_pi_controller_gains};
+use crate::{math::*};
+pub use crate::pi_control::{PIController, PIGains, PITuningFault, compute_current_pi_controller_gains};
 pub use crate::estimation::{
     ConstantMotorParameters, HallCalibrator, OfflineMotorEstimator, OfflineEstimatorInput,
     OfflineEstimatorCommand, OfflineEstimatorOutput, OfflineEstimatorConfig,

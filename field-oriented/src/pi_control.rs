@@ -2,6 +2,12 @@ use crate::{MotorParamsEstimate, ControllerParameters};
 use libm::{cosf, expf, powf, sinf};
 use num_complex::{Complex32};
 
+#[derive(Clone, Copy, defmt::Format)]
+pub enum PITuningFault {
+    Unstable,
+    InfeasibleMotorParameters,
+    MissingMotorParameters
+}
 
 #[derive(Clone, Copy, defmt::Format)]
 pub struct PIGains {
@@ -70,13 +76,13 @@ impl PIController {
 // PI autotuning based on step response requirements using pole-placement 
 pub fn compute_current_pi_controller_gains<const N: usize>(
     params: MotorParamsEstimate, pwm_freq_hz: f32
-) -> Option<ControllerParameters> {
-    let R = params.stator_resistance?;
-    let L = params.q_inductance?;
+) -> Result<ControllerParameters, PITuningFault> {
+    let R = params.stator_resistance.ok_or(PITuningFault::MissingMotorParameters)?;
+    let L = params.q_inductance.ok_or(PITuningFault::MissingMotorParameters)?;
     let T = 1.0 / pwm_freq_hz;
 
     if R <= 0.0 || L <= 0.0 || T <= 0.0 {
-        return None
+        return Err(PITuningFault::InfeasibleMotorParameters)
     }
 
     // Symbolically computed form for poles that give 5% overshoot and 1ms settling time:
@@ -102,9 +108,9 @@ pub fn compute_current_pi_controller_gains<const N: usize>(
     if small_gain_stability_check::<N>(
         R, L, &gains, pwm_freq_hz, &R_perturb, &L_perturb
     ) {
-        Some(gains)
+        Ok(gains)
     } else {
-        None
+        Err(PITuningFault::Unstable)
     }
 }
 
@@ -232,7 +238,7 @@ mod tests {
                 pm_flux_linkage: 0.0
             });
 
-            if let Some(gains) = compute_current_pi_controller_gains::<50>(params, 20_000.0) {
+            if let Ok(gains) = compute_current_pi_controller_gains::<50>(params, 20_000.0) {
                 assert!(
                     test_cfg.1.kp - 1e-3 < gains.d_pi.kp && gains.d_pi.kp < test_cfg.1.kp + 1e-3, 
                     "P gain mismatch {} < {} < {}", test_cfg.1.kp - 1e-3, gains.d_pi.kp, test_cfg.1.kp + 1e-3
