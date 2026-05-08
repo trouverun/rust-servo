@@ -3,17 +3,18 @@ use embassy_stm32::adc::{
     AnyAdcChannel, EocInterruptEnabled, Exten, ExternalTriggeredADC, JeosInterruptEnabled,
     NotQueued, Resolution, Running, SampleTime,
 };
+use embassy_stm32::timer::low_level::Timer;
 use embassy_stm32::{comp::*};
-use embassy_stm32::dac::Ch1;
-use embassy_stm32::dac::{Dac, DacCh1};
+use embassy_stm32::dac::Ch2;
+use embassy_stm32::dac::{Dac, DacCh2};
 use embassy_stm32::exti::{ExtiInput, TriggerEdge};
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::mode::Blocking;
 use embassy_stm32::opamp::{OpAmp, OpAmpSpeed};
 use embassy_stm32::pac::timer::vals::{Bkinp, Bkp};
 use embassy_stm32::peripherals::{
-    ADC1, ADC3, ADC4, COMP4, COMP6, COMP7, DAC1, DAC4, OPAMP3, OPAMP4, OPAMP5, TIM3, TIM4, TIM6,
-    TIM8, SPI1
+    ADC1, ADC3, ADC4, COMP4, COMP6, COMP7, DAC3, DAC4, FDCAN1, OPAMP3, OPAMP4, OPAMP5, TIM3, TIM4,
+    TIM6, TIM8, SPI1, DAC1, DAC2, TIM5
 };
 use embassy_stm32::time::Hertz;
 use embassy_stm32::timer::hall::{Config as HallConfig, HallSensor};
@@ -22,6 +23,7 @@ use embassy_stm32::timer::{
     pwm::{PwmDeadtime, PWM},
     trigger_output::BasicTrgoOutput,
 };
+use embassy_stm32::can::CanConfigurator;
 
 use crate::boards::encoder_mappings;
 
@@ -38,17 +40,21 @@ pub const BOARD_FEEDBACK_TRIGGER: Adc345RegularTrigger = Adc345RegularTrigger::T
 
 // Hall feedback:
 pub type HallFeedbackTimer = TIM3;
+pub type HallReadTimer = TIM5;
 
 // Encoder feedback:
 pub type EncoderDMATimer = TIM4;
 pub type EncoderSpi = SPI1;
 
+// CAN:
+pub type CanPeriph = FDCAN1;
+
 // PWM output:
 pub type CompU = COMP4;
 pub type CompV = COMP6;
 pub type CompW = COMP7;
-pub type ComparatorDacSingle = DAC1;
-pub type ComparatorDacChannel = Ch1;
+pub type ComparatorDacSingle = DAC3;
+pub type ComparatorDacChannel = Ch2;
 pub type ComparatorDacDual = DAC4;
 pub type PwmTimer = TIM8;
 
@@ -66,7 +72,10 @@ pub struct DebugMappings {
     pub pot_channel: AnyAdcChannel<'static, ADC1>,
     pub pot_adc: ExternalTriggeredADC<'static, ADC1, Running, NotQueued>,
     pub user_btn: ExtiInput<'static, Blocking>,
-    pub la_pin: Output<'static>
+    pub la_a: Output<'static>,
+    pub la_b: Output<'static>,
+    pub la_c: Output<'static>,
+    pub la_d: Output<'static>
 }
 
 pub fn map_peripherals(
@@ -78,6 +87,7 @@ pub fn map_peripherals(
     super::PwmOutputMappings,
     super::AccelerationMappings,
     super::MemoryMappings,
+    super::CanMappings,
     DebugMappings,
 ) {
     let adc_feedback = super::AdcFeedbackMappings {
@@ -98,16 +108,17 @@ pub fn map_peripherals(
 
     let hall_feedback = super::HallFeedbackMappings {
         sensor: HallSensor::new(p.TIM3, p.PE2, p.PE3, p.PE4, HallConfig::default()),
+        read_timer: Timer::new(p.TIM5)
     };
     let amt_encoder = encoder_mappings(
-        p.SPI1, p.PA5,  p.PA7, p.PG3, p.PA15,
+        p.SPI1, p.PG2,  p.PG4, p.PG3, p.PG5,
         p.TIM4, p.DMA1_CH1, p.DMA1_CH2, 
         p.DMA1_CH3, p.DMA1_CH4, p.DMA1_CH5
     );
 
     let pwm = super::PwmOutputMappings {
         comparators: super::CurrentComparators {
-            dac_single: DacCh1::new_internal_blocking(p.DAC1, 3.3),
+            dac_single: DacCh2::new_internal_blocking(p.DAC3, 3.3),
             dac_dual: Dac::new_internal_blocking(p.DAC4, 3.3),
             comp_u: Comp::new(
                 p.COMP4,
@@ -147,6 +158,10 @@ pub fn map_peripherals(
     let acceleration = super::AccelerationMappings { cordic: p.CORDIC };
     let storage = super::MemoryMappings { flash: p.FLASH };
 
+    let can = super::CanMappings {
+        configurator: unsafe { CanConfigurator::new_unbound(p.FDCAN1, p.PD0, p.PA12) },
+    };
+
     // Board specific debug assignments:
     let pot_channel = AdcChannel::degrade_adc(p.PA3);
     let mut pot_adc_config = AdcConfig::default();
@@ -168,7 +183,10 @@ pub fn map_peripherals(
         pot_channel,
         pot_adc,
         user_btn,
-        la_pin: Output::new(p.PD15, Level::Low, Speed::Low),
+        la_a: Output::new(p.PE8, Level::Low, Speed::Low),
+        la_b: Output::new(p.PE14, Level::Low, Speed::Low),
+        la_c: Output::new(p.PD15, Level::Low, Speed::Low),
+        la_d: Output::new(p.PE5, Level::Low, Speed::Low)
     };
 
     (
@@ -178,6 +196,7 @@ pub fn map_peripherals(
         pwm,
         acceleration,
         storage,
+        can,
         debug,
     )
 }

@@ -1,6 +1,6 @@
 use crate::boards::PWM_FREQ;
-use core::f32::consts::TAU;
-use field_oriented::PhaseValues;
+use core::{f32::consts::TAU};
+use field_oriented::{PhaseValues, HasRotorFeedback, RotorFeedback, RotorFeedbackFault};
 use num_traits::Float;
 
 pub fn wrap_to_pi(angle_rad: f32) -> f32 {
@@ -8,8 +8,8 @@ pub fn wrap_to_pi(angle_rad: f32) -> f32 {
     angle_rad - TAU * (angle_rad * INV_TAU).round()
 }
 
-pub fn iir_cutoff_to_alpha(cutoff_hz: f32) -> f32 {
-    libm::expf(-TAU * cutoff_hz / PWM_FREQ.0 as f32)
+pub fn iir_cutoff_to_alpha(sample_rate_hz: f32, cutoff_hz: f32) -> f32 {
+    libm::expf(-TAU * cutoff_hz / sample_rate_hz)
 }
 
 pub struct LowPassFilter {
@@ -19,9 +19,9 @@ pub struct LowPassFilter {
 }
 
 impl LowPassFilter {
-    pub fn new(cutoff_hz: f32) -> Self {
+    pub fn new(sample_rate_hz: f32, cutoff_hz: f32) -> Self {
         Self {
-            alpha: iir_cutoff_to_alpha(cutoff_hz),
+            alpha: iir_cutoff_to_alpha(sample_rate_hz, cutoff_hz),
             prev_filtered_value: 0.0,
             prev_measurement: 0.0,
         }
@@ -58,9 +58,9 @@ pub struct PhaseCurrentFilter {
 impl PhaseCurrentFilter {
     pub fn new(lowpass_cutoff_hz: f32, overcurrent_limit: f32) -> Self {
         let filters = FilteredPhases {
-            u: LowPassFilter::new(lowpass_cutoff_hz),
-            v: LowPassFilter::new(lowpass_cutoff_hz),
-            w: LowPassFilter::new(lowpass_cutoff_hz),
+            u: LowPassFilter::new(PWM_FREQ.0 as f32, lowpass_cutoff_hz),
+            v: LowPassFilter::new(PWM_FREQ.0 as f32, lowpass_cutoff_hz),
+            w: LowPassFilter::new(PWM_FREQ.0 as f32, lowpass_cutoff_hz),
         };
         Self {
             filters,
@@ -90,6 +90,52 @@ impl PhaseCurrentFilter {
             u: self.filters.u.filtered(),
             v: self.filters.v.filtered(),
             w: self.filters.w.filtered(),
+        }
+    }
+}
+
+pub struct FeedbackArbitrator {
+    hall_feedback: Option<Result<RotorFeedback, RotorFeedbackFault>>,
+    encoder_feedback: Option<Result<RotorFeedback, RotorFeedbackFault>>,
+    sensorless_feedback: Option<Result<RotorFeedback, RotorFeedbackFault>>,
+    hall_pattern: u8
+}
+
+impl FeedbackArbitrator {
+    pub fn new() -> Self {
+        Self {
+            hall_feedback: None,
+            encoder_feedback: None,
+            sensorless_feedback: None,
+            hall_pattern: 0
+        }
+    }
+    pub fn update_hall(&mut self, result: Result<RotorFeedback, RotorFeedbackFault>, pattern: u8) {
+        self.hall_feedback = Some(result);
+        self.hall_pattern = pattern;
+    }
+
+    pub fn update_encoder(&mut self, result: Result<RotorFeedback, RotorFeedbackFault>) {
+        self.encoder_feedback = Some(result);
+    }
+
+    pub fn update_sensorless(&mut self, result: Result<RotorFeedback, RotorFeedbackFault>) {
+
+    }
+
+    pub fn get_hall_pattern(&self) -> u8 {
+        self.hall_pattern
+    }
+}
+
+impl HasRotorFeedback for FeedbackArbitrator {
+    fn read(&mut self) -> Result<RotorFeedback, RotorFeedbackFault> {
+        if let Some(Ok(feedback)) = self.encoder_feedback {
+            Ok(feedback)
+        } else if let Some(feedback) = self.hall_feedback {
+            feedback
+        } else {
+            Err(RotorFeedbackFault::NoResponse)
         }
     }
 }

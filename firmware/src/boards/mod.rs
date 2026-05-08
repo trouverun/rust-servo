@@ -11,6 +11,7 @@ pub mod spi_encoder;
 pub use spi_encoder::*;
 
 use embassy_stm32::adc::AnyAdcChannel;
+use embassy_stm32::can::CanConfigurator;
 use embassy_stm32::comp::Comp;
 use embassy_stm32::dac::{Dac, DacChannel};
 #[cfg(feature = "spi-encoder")]
@@ -69,6 +70,7 @@ pub struct AdcFeedbackMappings {
 #[cfg(feature = "hall-feedback")]
 pub struct HallFeedbackMappings {
     pub sensor: HallSensor<'static, HallFeedbackTimer>,
+    pub read_timer: Timer<'static, HallReadTimer>
 }
 
 #[cfg(feature = "spi-encoder")]
@@ -110,4 +112,8 @@ pub struct AccelerationMappings {
 
 pub struct MemoryMappings {
     pub flash: Peri<'static, FLASH>,
+}
+
+pub struct CanMappings {
+    pub configurator: CanConfigurator<'static>,
 }

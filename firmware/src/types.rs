@@ -48,7 +48,7 @@ impl From<CalibrationFailureCause> for FaultCause {
 pub enum Command {
     Idle,
     StartCalibration { num_pole_pairs: u8 },
-    FinishTuning,
+    ResumeCalibration,
     FinishCalibration,
     EnableTorqueControl,
     EnableVelocityControl,
@@ -60,7 +60,8 @@ pub enum CalibrationPhase {
     EncoderZeroing { duration_waited_s: f32, reset_sent: bool },
     HallCalibration,
     MotorEstimation,
-    MotorTuning,
+    WaitingHallCompletion,
+    WaitingTuning,
     Done,
 }
 
@@ -124,8 +125,8 @@ impl OperatingMode {
                 OperatingMode::Calibration { calibrator: CalibrationRunner::new(num_pole_pairs) }
             }
             (OperatingMode::Idle, Command::EnableTorqueControl) => OperatingMode::TorqueControl,
-            (OperatingMode::Calibration { calibrator }, Command::FinishTuning) => {
-                calibrator.tuning_completed();
+            (OperatingMode::Calibration { calibrator }, Command::ResumeCalibration) => {
+                calibrator.force_step();
                 return;
             }
             (OperatingMode::Calibration { .. }, Command::FinishCalibration) => OperatingMode::Idle,
@@ -151,7 +152,7 @@ pub struct FirmwareConfig {
 impl Default for FirmwareConfig {
     fn default() -> Self {
         Self {
-            calibration_voltage: 18.0,
+            calibration_voltage: 12.0,
             calibration_current: 1.5,
             calibration_omega: 1.0,
             current_limit: 0.0,
@@ -171,6 +172,14 @@ impl Default for RuntimeValues {
             target_torque: 0.0,
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct CurrentLoopSnapshot {
+    pub iq_meas: f32,
+    pub id_meas: f32,
+    pub iq_target: f32,
+    pub id_target: f32,
 }
 
 #[derive(Clone, Copy)]

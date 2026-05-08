@@ -8,6 +8,10 @@ use embassy_stm32::adc::{
     Adc, AdcConfig, AnyAdcChannel, Dual, EocInterruptEnabled, Exten, ExternalTriggeredADC,
     JeosInterruptEnabled, Queued, Running as AdcRunning, SampleTime, StartMode,
 };
+use embassy_stm32::can::{
+    BufferedCan, BufferedCanReceiver, BufferedCanSender, OperatingMode, RxBuf, TxBuf,
+};
+use static_cell::StaticCell;
 use embassy_stm32::cordic::utils::{f32_to_q1_15, q1_15_to_f32};
 use embassy_stm32::cordic::{Cordic, NoScale, Precision, Sin, Sqrt, SqrtScale, Q15};
 use embassy_stm32::flash::{Blocking as BlockingFlash, Flash};
@@ -23,12 +27,12 @@ use embassy_stm32::timer::trigger_output::BasicTrgoOutput;
 use embassy_stm32::timer::Channel;
 use embassy_stm32::dma::StreamingChannel;
 use embassy_stm32::Config as RccConfig;
-use embassy_stm32::timer::low_level::{RoundTo, Timer};
+use embassy_stm32::timer::low_level::{Timer};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::pac::gpio::regs::Bsrr;
 use field_oriented::{
-    ControllerParameters, DoesFocMath, HasRotorFeedback, MotorParamsEstimate, PhaseValues,
-    RotorFeedback, RotorFeedbackFault, SinCosResult,
+    AngleType, ControllerParameters, DoesFocMath, HasRotorFeedback, 
+    MotorParamsEstimate, PhaseValues, RotorFeedback, RotorFeedbackFault, SinCosResult
 };
 
 const ADC_VOLTAGE: f32 = 3.3;
@@ -48,7 +52,7 @@ pub fn init() -> embassy_stm32::Peripherals {
         prediv: PllPreDiv::DIV4,
         mul: PllMul::MUL85,
         divr: Some(PllRDiv::DIV2),
-        divq: None,
+        divq: Some(PllQDiv::DIV4),
         divp: Some(PllPDiv::DIV8),
     });
     rcc_config.rcc.sys = Sysclk::PLL1_R;
@@ -57,6 +61,7 @@ pub fn init() -> embassy_stm32::Peripherals {
     rcc_config.rcc.apb2_pre = APBPrescaler::DIV1;
     rcc_config.rcc.mux.adc12sel = mux::Adcsel::PLL1_P;
     rcc_config.rcc.mux.adc345sel = mux::Adcsel::PLL1_P;
+    rcc_config.rcc.mux.fdcansel = mux::Fdcansel::PLL1_Q;
     embassy_stm32::init(rcc_config)
 }
 
@@ -199,8 +204,7 @@ impl AdcFeedback {
         let offset_va = -(val_va / 100) as i16;
         let offset_vb = -(val_vb / 100) as i16;
         let offset_w = -(val_w / 100) as i16;
-        let tmp_a = self
-            .adc_a
+        let tmp_a = self.adc_a
             .stop()
             .using_offsets(&[
                 (self.u_channel.get_hw_channel(), offset_u),
@@ -211,8 +215,7 @@ impl AdcFeedback {
                 JeosInterruptEnabled::ENABLED,
                 StartMode::EMPTY,
             );
-        let tmp_b = self
-            .adc_b
+        let tmp_b = self.adc_b
             .stop()
             .using_offsets(&[
                 (self.v_channel.get_hw_channel(), offset_vb),
@@ -335,18 +338,15 @@ impl AdcFeedback {
             ),
             _ => return (),
         };
-        self.adc_a
-            .insert_injected_context(&[source_a], FEEDBACK_TRIGGER_A, Exten::RISING_EDGE);
-        self.adc_b
-            .insert_injected_context(&[source_b], FEEDBACK_TRIGGER_B, Exten::RISING_EDGE);
+        self.adc_a.insert_injected_context(&[source_a], FEEDBACK_TRIGGER_A, Exten::RISING_EDGE);
+        self.adc_b.insert_injected_context(&[source_b], FEEDBACK_TRIGGER_B, Exten::RISING_EDGE);
         self.sampled_sector = sector;
     }
 
     pub fn read_board_info(&self) -> Option<(BusVoltage, BoardTemperature)> {
         if self.adc_a.check_eoc() {
             let vbus = self.adc_a.read() as f32 * VBUS_READING_SCLAER;
-            let tboard =
-                self.adc_b.read() as f32 * TBOARD_READING_SCLAER + BOARD.thermistor_scaling.bias;
+            let tboard = self.adc_b.read() as f32 * TBOARD_READING_SCLAER + BOARD.thermistor_scaling.bias;
             return Some((vbus, tboard));
         } else {
             return None;
@@ -384,7 +384,8 @@ impl HallInterpolationState {
 
 #[cfg(feature = "hall-feedback")]
 pub struct HallFeedback {
-    pub sensor: HallSensor<'static, HallFeedbackTimer>,
+    sensor: HallSensor<'static, HallFeedbackTimer>,
+    read_timer: Timer<'static, HallReadTimer>,
     hall_pattern_to_theta: Option<[f32; 6]>,
     /// Unsigned angular span of each hall sector, indexed by pattern - 1.
     /// Computed from the calibration table: distance from this edge to the next edge in the forward direction.
@@ -401,15 +402,24 @@ pub struct HallFeedback {
 #[cfg(feature = "hall-feedback")]
 impl HallFeedback {
     pub fn new(mappings: HallFeedbackMappings, cutoff_hz: f32) -> Self {
+        use embassy_stm32::timer::low_level::RoundTo;
+
+        let read_timer = mappings.read_timer;
+        read_timer.set_frequency(Hertz(10_000), RoundTo::Faster);
+        read_timer.enable_update_interrupt(true);
+        read_timer.generate_update_event();
+        read_timer.start();
+
         Self {
             sensor: mappings.sensor,
+            read_timer,
             hall_pattern_to_theta: None,
             sector_span: None,
             forward_next: None,
             state: HallInterpolationState::Stationary,
             prev_pattern: 0,
             prev_dir: 0,
-            filter: LowPassFilter::new(cutoff_hz),
+            filter: LowPassFilter::new(PWM_FREQ.0 as f32, cutoff_hz),
         }
     }
 
@@ -455,8 +465,12 @@ impl HallFeedback {
         self.sector_span = Some(sector_span);
     }
 
-    pub fn on_interrupt(&mut self) {
+    pub fn on_hall_interrupt(&mut self) {
         self.sensor.on_interrupt();
+    }
+
+    pub fn on_read_interrupt(&self) {
+        self.read_timer.clear_update_interrupt();
     }
 
     /// Determine rotation direction from a pattern transition.
@@ -480,9 +494,9 @@ impl HasRotorFeedback for HallFeedback {
         // Todo: return Result so caller can deal with invalid patterns 000 and 111
 
         // Return fault if this has not been calibrated yet:
-        let hall_pattern_to_theta = self
-            .hall_pattern_to_theta
-            .ok_or(RotorFeedbackFault::NotCalibrated)?;
+
+        use field_oriented::AngleType;
+        let hall_pattern_to_theta = self.hall_pattern_to_theta.ok_or(RotorFeedbackFault::NotCalibrated)?;
         let forward_next = self.forward_next.ok_or(RotorFeedbackFault::NotCalibrated)?;
         let sector_span = self.sector_span.ok_or(RotorFeedbackFault::NotCalibrated)?;
 
@@ -499,15 +513,14 @@ impl HasRotorFeedback for HallFeedback {
             (raw_state.prev_pattern.wrapping_sub(1) as usize).min(5)
         };
 
-        // Size of the Hall sector corresponding to the period (i.e. previous sector!), in electrical angle radians:
+        // Size of the Hall sector corresponding to the period (i.e. previous sector), in electrical angle radians:
         let prev_span = sector_span[prev_idx] as f32;
         // Size of the current Hall sector, in electrical angle radians:
         let span = sector_span[idx] as f32;
         // Fraction of previous period elapsed:
         let fraction = raw_state.extended_counter as f32 * raw_state.hall_period_reciprocal_count;
 
-        self.state
-            .step(self.prev_pattern, raw_state.pattern, self.prev_dir, dir);
+        self.state.step(self.prev_pattern, raw_state.pattern, self.prev_dir, dir);
         let (theta, omega) = match self.state {
             HallInterpolationState::Stationary => {
                 // Best standstill guess, midpoint of the current sector:
@@ -520,8 +533,7 @@ impl HasRotorFeedback for HallFeedback {
                 // - allow interpolation up to the midpoint of the current sector
                 //   (prevent being off by a full sector, if oscillating around same edge)
                 // - set omega to zero, to avoid huge values caused by oscillating around same edge rapidly
-                let theta_interpolation =
-                    dir as f32 * (prev_span * fraction).clamp(0.0, 0.5 * span);
+                let theta_interpolation = dir as f32 * (prev_span * fraction).clamp(0.0, 0.5 * span);
                 let theta = hall_pattern_to_theta[entry_idx] + theta_interpolation;
                 let omega = 0.0;
                 (theta, omega)
@@ -532,9 +544,7 @@ impl HasRotorFeedback for HallFeedback {
                 let theta = hall_pattern_to_theta[entry_idx] + theta_interpolation;
                 let signed_prev_span = dir as f32 * prev_span;
                 // Compute angular velocity from: rad * 1/ticks * Hz (ticks/s) = rad/s
-                let mut omega = signed_prev_span
-                    * raw_state.hall_period_reciprocal_count
-                    * self.sensor.get_tick_frequency_hz();
+                let mut omega = signed_prev_span * raw_state.hall_period_reciprocal_count * self.sensor.get_tick_frequency_hz();
                 // The fraction of the current hall sector we should have traveled, accounting for different size of span vs prev span:
                 let effective_fraction = (prev_span / span) * fraction;
                 // If we should have reached the next hall edge already, we need to taper down the overestimated velocity:
@@ -550,6 +560,7 @@ impl HasRotorFeedback for HallFeedback {
         let filtered_omega = self.filter.update(omega);
 
         Ok(RotorFeedback {
+            angle_type: AngleType::Electrical,
             theta,
             omega: filtered_omega,
         })
@@ -564,8 +575,7 @@ pub struct PwmOutput {
 
 impl PwmOutput {
     pub fn new(mappings: PwmOutputMappings) -> Self {
-        let mut tmp = mappings
-            .pwm
+        let mut tmp = mappings.pwm
             .with_peak_trgo2_from_ch4()
             .with_deadtime(mappings.deadtime);
 
@@ -649,9 +659,7 @@ impl DoesFocMath for Acceleration {
         const INV_PI: f32 = 1.0 / PI;
         let angle_normalized = (wrap_to_pi(angle_rad) * INV_PI).clamp(-1.0, 1.0);
         let angle_q15 = f32_to_q1_15(angle_normalized).unwrap();
-        let mut sin_cfg = self
-            .cordic
-            .configure::<Sin, Q15>(Precision::Iters12, NoScale);
+        let mut sin_cfg = self.cordic.configure::<Sin, Q15>(Precision::Iters12, NoScale);
         let started = sin_cfg.start_one_arg(angle_q15);
         let (sin_raw, cos_raw) = started.result_two_values();
 
@@ -680,9 +688,7 @@ impl DoesFocMath for Acceleration {
         };
         let x_q15 = f32_to_q1_15(x * arg_mul).unwrap();
 
-        let mut cfg = self
-            .cordic
-            .configure::<Sqrt, Q15>(Precision::Iters12, scale);
+        let mut cfg = self.cordic.configure::<Sqrt, Q15>(Precision::Iters12, scale);
         let raw = cfg.start_one_arg(x_q15).result_one_value();
 
         // Unscale and convert to float:
@@ -725,16 +731,44 @@ impl Memory {
     pub fn write_controller_parameters(&self, params: ControllerParameters) {}
 }
 
+const CAN_TX_BUF_SIZE: usize = 8;
+const CAN_RX_BUF_SIZE: usize = 16;
+
+pub struct CanBus {
+    buffered: BufferedCan<'static, CAN_TX_BUF_SIZE, CAN_RX_BUF_SIZE>,
+}
+
+impl CanBus {
+    pub fn new(mappings: CanMappings, bitrate: u32) -> Self {
+        static TX_BUF: StaticCell<TxBuf<CAN_TX_BUF_SIZE>> = StaticCell::new();
+        static RX_BUF: StaticCell<RxBuf<CAN_RX_BUF_SIZE>> = StaticCell::new();
+
+        let mut configurator = mappings.configurator;
+        configurator.set_bitrate(bitrate);
+        let can = configurator.start(OperatingMode::NormalOperationMode);
+        let buffered = can.buffered(TX_BUF.init(TxBuf::new()), RX_BUF.init(RxBuf::new()));
+
+        Self { buffered }
+    }
+
+    pub fn writer(&self) -> BufferedCanSender {
+        self.buffered.writer()
+    }
+
+    pub fn reader(&self) -> BufferedCanReceiver {
+        self.buffered.reader()
+    }
+}
+
 /// Where the Encoder SPI RX DMA channel circularly deposits the two response bytes
 static mut RX_BUF: [u8; 2] = [0xDE, 0xAD];
-
-/// AMT22 command bytes for the Encoder SPI TX DMA channels.
-/// 0x00, 0x00 = read position; 0x00, 0x60 = reset.
+/// AMT22 command bytes for the Encoder SPI TX DMA channels
 static TX1_BYTE: AtomicU8 = AtomicU8::new(0x00);
 static TX2_BYTE: AtomicU8 = AtomicU8::new(0x00);
+const AMT_READ_FREQ_HZ : f32 = 14285.714285714;
 
 pub struct AmtEncoder {
-    spi: DmaDrivenSpi<'static, EncoderSpi>,
+    _spi: DmaDrivenSpi<'static, EncoderSpi>,
     _cs: Output<'static>,
     _dma_timer: Timer<'static, EncoderDMATimer>,
     _cs_low_channel: StreamingChannel,
@@ -745,19 +779,17 @@ pub struct AmtEncoder {
     theta: Option<f32>,
     omega: Option<f32>,
     omega_lowpass: LowPassFilter,
-    dt_reciprocal: f32,
 }
 
 impl AmtEncoder {
     pub fn new(
-        mappings: SPIEncoderMappings<EncoderSpi, EncoderDMATimer>, 
-        reading_frquency_hz: f32, lowpass_cutoff_hz: f32
+        mappings: SPIEncoderMappings<EncoderSpi, EncoderDMATimer>, lowpass_cutoff_hz: f32
     ) -> Self {
         let mut dma_timer = mappings.dma_timer;
         // 10MHz tick rate = 0.01 us resolution:
         dma_timer.set_tick_freq(Hertz(10_000_000));
-        // 100 us = 10kHz read rate
-        dma_timer.set_autoreload_value(1000 * 60); 
+        // 70 us = ~14kHz read rate
+        dma_timer.set_autoreload_value(700); 
         // 0.1 us -> dma request to set cs low
         dma_timer.set_compare_value(Channel::Ch1, 1); 
         dma_timer.set_cc_dma_enable_state(Channel::Ch1, true);
@@ -768,7 +800,7 @@ impl AmtEncoder {
         dma_timer.set_compare_value(Channel::Ch3, 150); 
         dma_timer.set_cc_dma_enable_state(Channel::Ch3, true);
         // 20 us -> (DMA RX complete ISR) and dma request to set cs high
-        dma_timer.set_compare_value(Channel::Ch4, 200);  
+        dma_timer.set_compare_value(Channel::Ch4, 250);  
         dma_timer.set_cc_dma_enable_state(Channel::Ch4, true);
         dma_timer.generate_update_event();
 
@@ -820,7 +852,7 @@ impl AmtEncoder {
         dma_timer.start();
 
         Self {
-            spi,
+            _spi: spi,
             _cs: cs,
             _dma_timer: dma_timer,
             _cs_low_channel: cs_low_channel,
@@ -830,17 +862,17 @@ impl AmtEncoder {
             _cs_high_channel: cs_high_channel,
             theta: None,
             omega: None,
-            omega_lowpass: LowPassFilter::new(lowpass_cutoff_hz),
-            dt_reciprocal: reading_frquency_hz,
+            omega_lowpass: LowPassFilter::new(AMT_READ_FREQ_HZ, lowpass_cutoff_hz),
         }
     }
 
     pub fn update(&mut self, raw_reading: u16) {
         const SCALE: f32 = TAU / (1 << 12) as f32;
-        let theta = (raw_reading >> 2) as f32 * SCALE;
+        let count = (0xFFF - (raw_reading >> 2)) & 0xFFF;
+        let theta = count as f32 * SCALE;
         if let Some(theta_prev) = self.theta {
             let delta_theta = wrap_to_pi(theta - theta_prev).clamp(-PI, PI);
-            let omega_raw = delta_theta * self.dt_reciprocal;
+            let omega_raw = delta_theta * AMT_READ_FREQ_HZ;
             let filtered = self.omega_lowpass.update(omega_raw);
             self.omega = Some(filtered);
         }
@@ -876,17 +908,13 @@ impl AmtEncoder {
         self._dma_timer.reset();
     }
 
-    /// Issue a single AMT22 reset command (0x00, 0x60) and halt the timer.
-    ///
-    /// Caller must wait >=200 ms before calling `normal_mode` to resume position polling.
-    pub fn send_reset_requests(&mut self) {
+    pub fn send_zero_request(&mut self) {
         self.stop();
-        TX2_BYTE.store(0x60, Ordering::Relaxed);
+        TX2_BYTE.store(0x70, Ordering::Relaxed);
         self._dma_timer.set_one_pulse_mode(true);
         self.start();
     }
 
-    /// Restore continuous read-position polling after a reset.
     pub fn normal_mode(&mut self) {
         self.stop();
         self._dma_timer.set_one_pulse_mode(false);
@@ -900,9 +928,6 @@ impl AmtEncoder {
     }
 }
 
-/// AMT22 checksum (datasheet page 2):
-///   K1 = !(D13^D11^D9^D7^D5^D3^D1)   parity over odd-indexed position bits
-///   K0 = !(D12^D10^D8^D6^D4^D2^D0)   parity over even-indexed position bits
 fn amt22_checksum_ok(raw: u16) -> bool {
     let k1 = (raw >> 15) & 1;
     let k0 = (raw >> 14) & 1;
@@ -914,7 +939,7 @@ fn amt22_checksum_ok(raw: u16) -> bool {
 impl HasRotorFeedback for AmtEncoder {
     fn read(&mut self) -> Result<RotorFeedback, RotorFeedbackFault> {
         if let (Some(theta), Some(omega)) = (self.theta, self.omega) {
-            Ok(RotorFeedback { theta, omega })
+            Ok(RotorFeedback { angle_type: AngleType::Mechanical, theta, omega })
         } else {
             Err(RotorFeedbackFault::ErroneusValue)
         }

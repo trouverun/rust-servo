@@ -1,5 +1,6 @@
 use crate::boards::PWM_FREQ;
 use crate::types::{CalibrationPhase, CalibrationRunner};
+use defmt::info;
 use field_oriented::{
     ClarkParkValue, EstimationStepFault, FocInputType, HallCalibrator, MotorParamEstimator,
     MotorParamsEstimate, OfflineEstimatorConfig, OfflineEstimatorInput, OfflineEstimatorOutput,
@@ -91,9 +92,8 @@ impl CalibrationRunner {
                     let result = StageResult::HallCalibration {
                         angle_table: self.hall_calibrator.hall_pattern_to_theta,
                     };
-                    self.phase = CalibrationPhase::MotorEstimation;
-                    self.motor_estimator.start(self.num_pole_pairs);
-                    let output = self.motor_estimation_output(inputs);
+                    self.phase = CalibrationPhase::WaitingHallCompletion;
+                    let output = self.idle_output(inputs);
                     (output, Some(result))
                 } else {
                     const PWM_FREQ_HZ: u32 = PWM_FREQ.0;
@@ -111,12 +111,13 @@ impl CalibrationRunner {
                 }
             }
             CalibrationPhase::MotorEstimation => {
-                if self.motor_estimator.should_reset_controller() {
+                if let Some(fault) = self.motor_estimator.get_fault() {
+                    self.phase = CalibrationPhase::Done;
                     let output = self.idle_output(inputs);
-                    (output, Some(StageResult::UnwindRequest))
-                } else if self.motor_estimator.should_tune_controller() {
-                    let output = self.idle_output(inputs);
-                    (output, Some(StageResult::TuningRequest { params_estimate: self.motor_estimator.get_estimate() } ))
+                    let result = StageResult::Failure {
+                        cause: CalibrationFailureCause::MotorParameterEstimation { fault },
+                    };
+                    (output, Some(result))
                 } else if self.motor_estimator.estimation_done() {
                     self.phase = CalibrationPhase::Done;
                     let output = self.idle_output(inputs);
@@ -124,13 +125,14 @@ impl CalibrationRunner {
                         motor_params: self.motor_estimator.get_estimate(),
                     });
                     (output, result)
-                } else if let Some(fault) = self.motor_estimator.get_fault() {
-                    self.phase = CalibrationPhase::Done;
+                } else if self.motor_estimator.should_unwind_controller() {
+                    self.motor_estimator.acnkowledge_unwind_request();
                     let output = self.idle_output(inputs);
-                    let result = StageResult::Failure {
-                        cause: CalibrationFailureCause::MotorParameterEstimation { fault },
-                    };
-                    (output, Some(result))
+                    (output, Some(StageResult::UnwindRequest))
+                } else if self.motor_estimator.should_tune_controller() {
+                    self.phase = CalibrationPhase::WaitingTuning;
+                    let output = self.idle_output(inputs);
+                    (output, Some(StageResult::TuningRequest { params_estimate: self.motor_estimator.get_estimate() } ))
                 } else {
                     let output = self.motor_estimation_output(inputs);
                     (output, None)
@@ -177,7 +179,18 @@ impl CalibrationRunner {
         &mut self.motor_estimator
     }
 
-    pub fn tuning_completed(&mut self) {
-        self.phase = CalibrationPhase::MotorEstimation;
+    /// Resume after a wait state (e.g. EEPROM write, controller tuning, etc.)
+    pub fn force_step(&mut self) {
+        match &self.phase {
+            CalibrationPhase::WaitingHallCompletion => {
+                self.motor_estimator.start(self.num_pole_pairs);
+                self.phase = CalibrationPhase::MotorEstimation;
+            }
+            CalibrationPhase::WaitingTuning => {
+                self.motor_estimator.acknowledge_tuning_request();
+                self.phase = CalibrationPhase::MotorEstimation;
+            }
+            _ => {}
+        }
     }
 }
