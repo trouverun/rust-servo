@@ -1,5 +1,5 @@
 use crate::boards::PWM_FREQ;
-use crate::types::{CalibrationPhase, CalibrationRunner};
+use crate::types::{CalibrationPhase, CalibrationRunner, FaultCause};
 use field_oriented::{
     ClarkParkValue, EstimationStepFault, FocInputType, HallCalibrator, MotorParamEstimator,
     MotorParamsEstimate, OfflineEstimatorConfig, OfflineEstimatorInput, OfflineEstimatorOutput,
@@ -75,20 +75,17 @@ impl CalibrationRunner {
                         q: 0.0,
                     }),
                 };
-                if *duration_waited_s < 4.0 {
-                    if *duration_waited_s >= 3.0 && !*reset_sent {
-                        result = Some(StageResult::ZeroEncoderRequest);
-                        *reset_sent = true;
-                    }
-                } else {
-                    self.phase = CalibrationPhase::HallCalibration { time_passed_s: 0.0 };
-                    self.hall_calibrator.start();
+                if *duration_waited_s >= 5.0 {
+                    result = Some(StageResult::Failure { cause: CalibrationFailureCause::Timeout })
+                } else if *duration_waited_s >= 3.0 && !*reset_sent {
+                    result = Some(StageResult::ZeroEncoderRequest);
+                    *reset_sent = true;
                 }
                 (output, result)
             }
             CalibrationPhase::HallCalibration { time_passed_s } => {
                 *time_passed_s += DT;
-                if *time_passed_s > 15.0 {
+                if *time_passed_s > 30.0 {
                     let result = StageResult::Failure { cause: CalibrationFailureCause::Timeout };
                     let output = self.idle_output(inputs);
                     (output, Some(result))
@@ -101,9 +98,7 @@ impl CalibrationRunner {
                     (output, Some(result))
                 } else {
                     const PWM_FREQ_HZ: u32 = PWM_FREQ.0;
-                    let theta = self
-                        .hall_calibrator
-                        .calibration_step::<PWM_FREQ_HZ>(inputs.hall_pattern, inputs.target_omega);
+                    let theta = self.hall_calibrator.calibration_step::<PWM_FREQ_HZ>(inputs.hall_pattern, inputs.target_omega);
                     let output = CalibrationOutput {
                         theta,
                         foc_command: FocInputType::CalibrationCurrents(ClarkParkValue {
@@ -186,6 +181,10 @@ impl CalibrationRunner {
     /// Resume after a wait state (e.g. EEPROM write, controller tuning, etc.)
     pub fn force_step(&mut self) {
         match &self.phase {
+            CalibrationPhase::EncoderZeroing { .. } => {
+                self.phase = CalibrationPhase::HallCalibration { time_passed_s: 0.0 };
+                self.hall_calibrator.start();
+            }
             CalibrationPhase::WaitingHallCompletion => {
                 self.motor_estimator.start(self.num_pole_pairs);
                 self.phase = CalibrationPhase::MotorEstimation;

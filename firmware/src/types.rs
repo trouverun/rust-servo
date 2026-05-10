@@ -1,4 +1,5 @@
 use crate::calibration::CalibrationFailureCause;
+use crate::memory::MemoryFault;
 use field_oriented::{EstimationStepFault, FocFault, HallCalibrator, OfflineMotorEstimator, PITuningFault};
 use defmt::{Format, Formatter, write, info};
 
@@ -13,12 +14,17 @@ pub enum FaultCause {
     EstimationFail { cause: EstimationStepFault },
     ControllerTuningFail { cause: PITuningFault },
     MissingMotorParams,
+    MissingControllerGains,
+    ControllerFail { cause: FocFault },
+    MemoryFault { cause: MemoryFault },
 }
 
 impl From<FocFault> for FaultCause {
     fn from(f: FocFault) -> Self {
         match f {
             FocFault::MissingMotorParams => FaultCause::MissingMotorParams,
+            FocFault::MissingControllerGains => FaultCause::MissingControllerGains,
+            _ => FaultCause::ControllerFail { cause: f },
         }
     }
 }
@@ -48,6 +54,12 @@ impl From<CalibrationFailureCause> for FaultCause {
 impl From<PITuningFault> for FaultCause {
     fn from(f: PITuningFault) -> Self {
         FaultCause::ControllerTuningFail { cause: f }
+    }
+}
+
+impl From<MemoryFault> for FaultCause {
+    fn from(cause: MemoryFault) -> Self {
+        FaultCause::MemoryFault { cause }
     }
 }
 
@@ -149,6 +161,7 @@ pub struct BoardStatus {
     pub temperature: Option<f32>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct FirmwareConfig {
     pub calibration_voltage: f32,
     pub calibration_current: f32,

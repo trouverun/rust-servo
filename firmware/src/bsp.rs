@@ -1,5 +1,5 @@
 use crate::boards::*;
-use crate::types::FirmwareConfig;
+use crate::memory::{sector_offset, Stored, MemoryFault, CRC32, MAX_RECORD_BYTES, SECTOR_SIZE};
 use crate::utils::{wrap_to_pi, LowPassFilter};
 use core::f32::consts::{PI, TAU};
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
@@ -11,6 +11,7 @@ use embassy_stm32::can::{
     BufferedCan, BufferedCanReceiver, BufferedCanSender, OperatingMode, RxBuf, TxBuf,
 };
 use static_cell::StaticCell;
+use embassy_stm32::flash::WRITE_SIZE;
 use embassy_stm32::cordic::utils::{f32_to_q1_15, q1_15_to_f32};
 use embassy_stm32::cordic::{Cordic, NoScale, Precision, Sin, Sqrt, SqrtScale, Q15};
 use embassy_stm32::flash::{Blocking as BlockingFlash, Flash};
@@ -28,8 +29,8 @@ use embassy_stm32::timer::low_level::{Timer};
 use embassy_stm32::time::Hertz;
 use embassy_stm32::pac::gpio::regs::Bsrr;
 use field_oriented::{
-    AngleType, ControllerParameters, DoesFocMath, HasRotorFeedback, 
-    MotorParamsEstimate, PhaseValues, RotorFeedback, RotorFeedbackFault, SinCosResult
+    AngleType, DoesFocMath, HasRotorFeedback,
+    PhaseValues, RotorFeedback, RotorFeedbackFault, SinCosResult
 };
 
 const ADC_VOLTAGE: f32 = 3.3;
@@ -669,41 +670,6 @@ impl DoesFocMath for Acceleration {
     }
 }
 
-pub struct Memory {
-    flash: Flash<'static, BlockingFlash>,
-}
-
-impl Memory {
-    pub fn new(mappings: MemoryMappings) -> Self {
-        let flash = Flash::new_blocking(mappings.flash);
-        Self { flash }
-    }
-
-    pub fn read_firmware_config(&self) -> Option<FirmwareConfig> {
-        None
-    }
-
-    pub fn write_firmware_config(&self, config: FirmwareConfig) {}
-
-    pub fn read_hall_calibrations(&self) -> Option<[f32; 6]> {
-        None
-    }
-
-    pub fn write_hall_calibrations(&self, calibrations: [f32; 6]) {}
-
-    pub fn read_motor_parameters(&self) -> Option<MotorParamsEstimate> {
-        None
-    }
-
-    pub fn write_motor_parameters(&self, params: MotorParamsEstimate) {}
-
-    pub fn read_controller_parameters(&self) -> Option<ControllerParameters> {
-        None
-    }
-
-    pub fn write_controller_parameters(&self, params: ControllerParameters) {}
-}
-
 const CAN_TX_BUF_SIZE: usize = 8;
 const CAN_RX_BUF_SIZE: usize = 16;
 
@@ -738,7 +704,7 @@ static mut RX_BUF: [u8; 2] = [0xDE, 0xAD];
 /// AMT22 command bytes for the Encoder SPI TX DMA channels
 static TX1_BYTE: AtomicU8 = AtomicU8::new(0x00);
 static TX2_BYTE: AtomicU8 = AtomicU8::new(0x00);
-const AMT_READ_FREQ_HZ : f32 = 14285.714285714;
+const AMT_READ_FREQ_HZ : f32 = 10_000.0;
 
 pub struct AmtEncoder {
     _spi: DmaDrivenSpi<'static, EncoderSpi>,
@@ -761,8 +727,8 @@ impl AmtEncoder {
         let mut dma_timer = mappings.dma_timer;
         // 10MHz tick rate = 0.01 us resolution:
         dma_timer.set_tick_freq(Hertz(10_000_000));
-        // 70 us = ~14kHz read rate
-        dma_timer.set_autoreload_value(700); 
+        // 100 us = ~10kHz read rate
+        dma_timer.set_autoreload_value(1000); 
         // 0.1 us -> dma request to set cs low
         dma_timer.set_compare_value(Channel::Ch1, 1); 
         dma_timer.set_cc_dma_enable_state(Channel::Ch1, true);
@@ -866,7 +832,6 @@ impl AmtEncoder {
                 core::ptr::read_volatile(core::ptr::addr_of!(RX_BUF[1])),
             )
         };
-
         let raw = (u16::from(b0) << 8) | u16::from(b1);
 
         if amt22_checksum_ok(raw) {
@@ -874,7 +839,7 @@ impl AmtEncoder {
         } else {
             self.invalidate();
         }
-    }    
+    }   
     
     pub fn stop(&mut self) {
         self._dma_timer.stop();
@@ -921,36 +886,106 @@ impl HasRotorFeedback for AmtEncoder {
 
 pub struct Watchdog {
     timer: Timer<'static, WatchdogTimer>,
-    faulted: bool
+    started: bool,
+    faulted: bool,
+    acknowledged: bool,
 }
 
 impl Watchdog {
     pub fn new(mappings: WatchdogMappings) -> Self {
         let timer = mappings.timer;
         timer.set_frequency(Hertz((0.9*PWM_FREQ.0 as f32) as u32), embassy_stm32::timer::low_level::RoundTo::Slower);
-        timer.enable_update_interrupt(true);
         timer.generate_update_event();
-        timer.start();
-        Self { timer, faulted: false }
+        timer.clear_update_interrupt();
+        timer.enable_update_interrupt(true);
+        Self { timer, started: false, faulted: false, acknowledged: false }
+    }
+
+    pub fn register_fault(&mut self) {
+        self.timer.clear_update_interrupt();
+        self.timer.stop();
+        self.started = false;
+        self.faulted = true;
+        self.acknowledged = false;
     }
 
     pub fn acknowledge_fault(&mut self) {
-        self.timer.clear_update_interrupt();
-        self.timer.stop();
-        self.faulted = true;
+        self.acknowledged = true;
     }
 
     pub fn is_faulted(&self) -> bool {
         self.faulted
     }
 
-    pub fn start(&mut self) {
+    pub fn fault_acknowledged(&self) -> bool {
+        self.acknowledged
+    }
+
+    pub fn restart(&mut self) {
         self.faulted = false;
         self.timer.reset();
         self.timer.start();
+        self.started = true;
     }
 
-    pub fn feed(&self) {
+    pub fn feed(&mut self) {
+        if !self.started {
+            self.timer.start();
+            self.started = true;
+        }
         self.timer.reset();
+    }
+}
+
+pub struct Memory {
+    flash: Flash<'static, BlockingFlash>,
+}
+
+impl Memory {
+    pub fn new(mappings: MemoryMappings) -> Self {
+        let flash = Flash::new_blocking(mappings.flash);
+        Self { flash }
+    }
+
+    /// Reads the record of type `T` from its flash sector.
+    ///
+    /// `Ok(None)` means the sector was never written; `Err(Corrupt)` means a
+    /// record is present but failed to decode or its CRC didn't match.
+    pub fn load<T: Stored>(&mut self) -> Result<Option<T>, MemoryFault> {
+        let mut buf = [0u8; MAX_RECORD_BYTES];
+        self.flash
+            .blocking_read(sector_offset(T::SECTOR), &mut buf)
+            .map_err(|_| MemoryFault::FlashInternalFault)?;
+        if buf.iter().all(|&b| b == 0xFF) {
+            return Ok(None); // erased sector
+        }
+        let (value, rest) = postcard::take_from_bytes::<T>(&buf).map_err(|_| MemoryFault::CorruptedData)?;
+        let used = buf.len() - rest.len();
+        let crc_bytes = buf.get(used..used + 4).ok_or(MemoryFault::CorruptedData)?;
+        let stored = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+        if CRC32.checksum(&buf[..used]) != stored {
+            return Err(MemoryFault::CorruptedData);
+        }
+        Ok(Some(value))
+    }
+
+    /// Erases the record's sector and writes `value` back.
+    pub fn store<T: Stored>(&mut self, value: &T) -> Result<(), MemoryFault> {
+        let mut buf = [0u8; MAX_RECORD_BYTES];
+        let used = postcard::to_slice(value, &mut buf[..MAX_RECORD_BYTES - 4])
+            .map_err(|_| MemoryFault::TooLarge)?
+            .len();
+        let crc = CRC32.checksum(&buf[..used]);
+        buf[used..used + 4].copy_from_slice(&crc.to_le_bytes());
+        let write_len = (used + 4).next_multiple_of(WRITE_SIZE);
+
+        let off = sector_offset(T::SECTOR);
+        self.flash
+            .blocking_erase(off, off + SECTOR_SIZE)
+            .map_err(|_| MemoryFault::FlashInternalFault)?;
+        self.flash
+            .blocking_write(off, &buf[..write_len])
+            .map_err(|_| MemoryFault::FlashInternalFault)?;
+        Ok(())
     }
 }

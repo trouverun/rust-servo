@@ -7,6 +7,7 @@ mod boards;
 mod bsp;
 mod calibration;
 mod can;
+mod memory;
 mod types;
 mod utils;
 pub mod pac {
@@ -22,14 +23,13 @@ mod app {
         PwmOutput, Watchdog
     };
     use crate::calibration::StageResult;
-    use crate::types::{CalibrationPhase, *};
+    use crate::types::{CalibrationPhase, Command, *};
     use crate::types::{BoardStatus, OperatingMode};
     use crate::utils::{PhaseCurrentFilter, FeedbackArbitrator};
     use crate::{
         calibration::{CalibrationInputs},
         types::ButtonState,
     };
-use core::ops::Not;
     use defmt::info;
     use defmt_rtt as _;
     use crate::can::messages::MotorCurrents;
@@ -40,8 +40,8 @@ use core::ops::Not;
     use embassy_stm32::interrupt::typelevel::Handler;
     use embassy_stm32::{peripherals::TIM2, rcc};
     use field_oriented::{
-        AngleType, ConstantMotorParameters, FOC, FocConfig, FocInput, FocInputType, 
-        HasRotorFeedback, MotorParamEstimator, MotorParamsEstimate, PhaseValues, RotorFeedback, 
+        AngleType, ConstantMotorParameters, ControllerParameters, FOC, FocConfig, FocInput, FocInputType,
+        HasRotorFeedback, MotorParamEstimator, MotorParamsEstimate, PhaseValues, RotorFeedback,
         compute_current_pi_controller_gains
     };
     use rtic_monotonics::stm32::{ExtU64, Tim2 as Mono};
@@ -97,12 +97,16 @@ use core::ops::Not;
         let mut hall_feedback = bsp::HallFeedback::new(hall_mappings, 1000.0);
         let amt_encoder = bsp::AmtEncoder::new(encoder_mappings, 1000.0);
         let acceleration = bsp::Acceleration::new(accel_mappings);
-        let memory = bsp::Memory::new(memory_mappings);
+        let mut memory = bsp::Memory::new(memory_mappings);
+        let mut mode = OperatingMode::Idle;
 
-        let mut config = if let Some(firmware_config) = memory.read_firmware_config() {
-            firmware_config
-        } else {
-            FirmwareConfig::default()
+        let mut config = match memory.load::<FirmwareConfig>() {
+            Ok(Some(c)) => c,
+            Ok(None) => FirmwareConfig::default(),
+            Err(e) => { 
+                mode.on_command(Command::AssertFault { cause: e.into() }); 
+                FirmwareConfig::default() 
+            }
         };
         config.current_limit = 2.5;
         let current_filter = PhaseCurrentFilter::new(2500.0, config.current_limit);
@@ -112,21 +116,25 @@ use core::ops::Not;
         };
         let mut foc = FOC::new(foc_cfg, PWM_FREQ.0 as f32);
 
-        // Try to read calibrations and configurations from memory:
-        let mut motor_parameters = if let Some(saved_parameters) = memory.read_motor_parameters() {
-            ConstantMotorParameters::from_other(saved_parameters)
-        } else {
-            ConstantMotorParameters {
-                params: MotorParamsEstimate::new_empty(),
+        let mut motor_parameters = match memory.load::<MotorParamsEstimate>() {
+            Ok(Some(p)) => {info!("Motpar {}", p); ConstantMotorParameters::from_other(p)},
+            Ok(None) => ConstantMotorParameters { params: MotorParamsEstimate::new_empty() },
+            Err(e) => { 
+                mode.on_command(Command::AssertFault { cause: e.into() }); 
+                ConstantMotorParameters { params: MotorParamsEstimate::new_empty() } 
             }
         };
         motor_parameters.params.num_pole_pairs = Some(2);
 
-        if let Some(hall_calibrations) = memory.read_hall_calibrations() {
-            hall_feedback.set_calibration(hall_calibrations);
+        match memory.load::<[f32; 6]>() {
+            Ok(Some(cal)) => {info!("Halcal {}", cal); hall_feedback.set_calibration(cal)},
+            Ok(None) => {}
+            Err(e) => mode.on_command(Command::AssertFault { cause: e.into() }),
         }
-        if let Some(controller_parameters) = memory.read_controller_parameters() {
-            foc.set_pi_gains(controller_parameters);
+        match memory.load::<ControllerParameters>() {
+            Ok(Some(p)) => {info!("Contpar {}", p); foc.set_pi_gains(Some(p))},
+            Ok(None) => {}
+            Err(e) => mode.on_command(Command::AssertFault { cause: e.into() }),
         }
 
         let can_bus = bsp::CanBus::new(can_mappings, 1_000_000);
@@ -140,7 +148,7 @@ use core::ops::Not;
         debug_print::spawn().unwrap();
 
         (Shared {
-            mode: OperatingMode::Idle,
+            mode,
             board_status: BoardStatus {
                 dc_bus_voltage: None,
                 temperature: None,
@@ -169,16 +177,13 @@ use core::ops::Not;
         })
     }
 
-    #[task(priority = 4, binds = TIM7_DAC, shared = [watchdog, mode])]
+    #[task(priority = 6, binds = TIM7_DAC, shared = [watchdog])]
     fn watchdog_isr(mut cx: watchdog_isr::Context) {
-        cx.shared.watchdog.lock(|wd| wd.acknowledge_fault());
-        cx.shared.mode.lock(|mode| {
-            mode.on_command(Command::AssertFault { cause: FaultCause::Watchdog });
-        });
+        cx.shared.watchdog.lock(|wd| wd.register_fault());
     }
 
     #[task(
-        priority = 3, binds = ADC3,
+        priority = 6, binds = ADC3,
         local = [adc_feedback, current_filter, acceleration],
         shared = [
             pwm_output, foc, motor_parameters, feedback_arbitrator,
@@ -187,8 +192,6 @@ use core::ops::Not;
         ]
     )]
     fn currents_adc_isr(mut cx: currents_adc_isr::Context) {
-        cx.shared.debug_mappings.lock(|dm| dm.la_a.set_high());
-
         cx.shared.mode.lock(|mode| {
             let calibrating = match mode {
                 // The calibration state machine should not be stepped in the wait phases:
@@ -204,7 +207,15 @@ use core::ops::Not;
 
             // if FOC ISR (sampled phase currents):
             if let Some(phase_currents) = cx.local.adc_feedback.read_currents() {
-                cx.shared.watchdog.lock(|wd| wd.feed());
+                cx.shared.debug_mappings.lock(|dm| dm.la_a.set_high());
+                cx.shared.watchdog.lock(|wd| {
+                    if wd.is_faulted() && wd.fault_acknowledged() {
+                        wd.acknowledge_fault();
+                        mode.on_command(Command::AssertFault { cause: FaultCause::Watchdog });
+                    } else {
+                        wd.feed()
+                    }
+                });
                 // Check for overcurrent:
                 cx.local.current_filter.update(phase_currents);
                 let overcurrent = cx.local.current_filter.check_overcurrent();
@@ -228,8 +239,6 @@ use core::ops::Not;
 
                 // Inactive or blocked from running, set idle outputs:
                 if !active || overcurrent || rotor_feedback_fault || dc_bus_reading.is_none() {
-                    // TODO: need to come here also if:
-                    // PI gains not configured
                     cx.shared.pwm_output.lock(|pwm| {
                         pwm.set_duty_cycles(PhaseValues::safe())
                     });
@@ -332,6 +341,7 @@ use core::ops::Not;
 
                 // Always sample something to keep the ADC EOC ISRs running:
                 cx.local.adc_feedback.sample_sector(voltage_hexagon_sector);
+                cx.shared.debug_mappings.lock(|dm| dm.la_a.set_low());
             }
         });
 
@@ -342,11 +352,9 @@ use core::ops::Not;
                 bs.temperature = Some(tboard);
             });
         }
-
-        cx.shared.debug_mappings.lock(|dm| dm.la_a.set_low());
     }
 
-    #[task(priority = 1, shared = [amt_encoder])]
+    #[task(priority = 1, shared = [amt_encoder, mode])]
     async fn reset_encoder(mut cx: reset_encoder::Context) {
         cx.shared.amt_encoder.lock(|ae| {
             ae.stop();
@@ -365,32 +373,52 @@ use core::ops::Not;
         cx.shared.amt_encoder.lock(|ae| {
             ae.normal_mode();
         });
-    }
 
-    #[task(priority = 1, shared = [mode, hall_feedback])]
-    async fn update_hall_table(mut cx: update_hall_table::Context, angle_table: [f32; 6]) {
-        info!("Angle table {}", angle_table);
-        cx.shared.hall_feedback.lock(|hf| hf.set_calibration(angle_table));
-        cx.shared.mode.lock(|mode| {
+        cx.shared.mode.lock(|mode: &mut OperatingMode| {
             mode.on_command(Command::ResumeCalibration);
         });
     }
 
-    #[task(priority = 1, shared = [mode, foc])]
+    #[task(priority = 1, shared = [mode, hall_feedback, memory])]
+    async fn update_hall_table(mut cx: update_hall_table::Context, angle_table: [f32; 6]) {
+        info!("Angle table {}", angle_table);
+        cx.shared.hall_feedback.lock(|hf| hf.set_calibration(angle_table));
+        let command = cx.shared.memory.lock(|memory| {
+            match memory.store(&angle_table) {
+                Ok( .. ) => Command::ResumeCalibration,
+                Err(f) => Command::AssertFault { cause: f.into() }
+            }
+        });
+        cx.shared.mode.lock(|mode: &mut OperatingMode| {
+            mode.on_command(command);
+        });
+    }
+
+    #[task(priority = 1, shared = [mode, foc, memory])]
     async fn tune_pi(mut cx: tune_pi::Context, estimate: MotorParamsEstimate) {
         let result = compute_current_pi_controller_gains::<50>(estimate, PWM_FREQ.0 as f32);
         info!("PI gains {}", result);
         match result {
             Ok(pi_gains) => {
                 cx.shared.foc.lock(|foc| {
-                    foc.set_pi_gains(pi_gains);
+                    foc.set_pi_gains(Some(pi_gains));
                     foc.clear_windup();
                 });
+                let command = cx.shared.memory.lock(|memory| {
+                    match memory.store(&pi_gains) {
+                        Ok( .. ) => Command::ResumeCalibration,
+                        Err(f) => Command::AssertFault { cause: f.into() }
+                    }
+                });
                 cx.shared.mode.lock(|mode| {
-                    mode.on_command(Command::ResumeCalibration);
+                    mode.on_command(command);
                 });
             }
             Err(fault) => {
+                cx.shared.foc.lock(|foc| {
+                    foc.set_pi_gains(None);
+                    foc.clear_windup();
+                });
                 cx.shared.mode.lock(|mode| {
                     mode.on_command(Command::AssertFault {
                         cause: fault.into(),
@@ -400,18 +428,24 @@ use core::ops::Not;
         }
     }
 
-    #[task(priority = 1, shared = [motor_parameters, mode])]
+    #[task(priority = 1, shared = [motor_parameters, mode, memory])]
     async fn update_motor_params(mut cx: update_motor_params::Context, parameters: MotorParamsEstimate) {
         info!("Params {}", parameters);
         cx.shared.motor_parameters.lock(|active_params| {
             active_params.copy_other(parameters);
         });
+        let command = cx.shared.memory.lock(|memory| {
+            match memory.store(&parameters) {
+                Ok( .. ) => Command::FinishCalibration,
+                Err(f) => Command::AssertFault { cause: f.into() }
+            }
+        });
         cx.shared.mode.lock(|mode| {
-            mode.on_command(Command::FinishCalibration);
+            mode.on_command(command);
         });
     }
 
-    #[task(priority = 1, binds = TIM8_BRK, shared = [mode, pwm_output])]
+    #[task(priority = 6, binds = TIM8_BRK, shared = [mode, pwm_output])]
     fn on_tim8(mut cx: on_tim8::Context) {
         let bk1_cleared = cx.shared.pwm_output.lock(|pwm| pwm.check_break1());
         let bk2_cleared = cx.shared.pwm_output.lock(|pwm| pwm.check_break2());
@@ -432,14 +466,14 @@ use core::ops::Not;
         }
     }
 
-    #[task(priority = 2, binds = TIM3, shared = [hall_feedback])]
+    #[task(priority = 5, binds = TIM3, shared = [hall_feedback])]
     fn on_tim3(mut cx: on_tim3::Context) {
         cx.shared.hall_feedback.lock(|hall_feedback| {
             hall_feedback.on_hall_interrupt();
         });
     }
 
-    #[task(priority = 2, binds = TIM5, shared = [hall_feedback, feedback_arbitrator, debug_mappings])]
+    #[task(priority = 5, binds = TIM5, shared = [hall_feedback, feedback_arbitrator, debug_mappings])]
     fn on_tim5(mut cx: on_tim5::Context) {
         cx.shared.debug_mappings.lock(|dm| dm.la_b.toggle());
         let (hall_feedback, hall_pattern) = cx.shared.hall_feedback.lock(|hall_feedback| {
@@ -448,16 +482,18 @@ use core::ops::Not;
         });
         cx.shared.feedback_arbitrator.lock(|fa| {
             fa.update_hall(hall_feedback, hall_pattern);
-        })
+        });
+        cx.shared.debug_mappings.lock(|dm| dm.la_b.toggle());
     }
 
-    #[task(priority = 2, binds = DMA1_CHANNEL4, shared=[amt_encoder, feedback_arbitrator, debug_mappings])]
+    #[task(priority = 4, binds = DMA1_CHANNEL4, shared=[amt_encoder, feedback_arbitrator, debug_mappings])]
     fn on_amt22_receive(mut cx: on_amt22_receive::Context) {
         cx.shared.debug_mappings.lock(|dm| dm.la_c.toggle());
         let amt_feedback = cx.shared.amt_encoder.lock(|ae| {
             ae.on_transaction_complete();
             ae.read()
         });
+        cx.shared.debug_mappings.lock(|dm| dm.la_c.toggle());
         cx.shared.feedback_arbitrator.lock(|fa| {
             fa.update_encoder(amt_feedback);
         })
@@ -499,7 +535,7 @@ use core::ops::Not;
         unsafe { <IT0InterruptHandler<CanPeriph> as Handler<_>>::on_interrupt(); }
     }
 
-    #[idle(shared=[amt_encoder, debug_mappings])]
+    #[idle(shared=[debug_mappings])]
     fn idle(mut cx: idle::Context) -> ! {
         loop {
             cortex_m::asm::wfi();
@@ -575,7 +611,7 @@ use core::ops::Not;
 
             if let Ok(vals) = data {
                 info!("Angle: {}, Omega {}", vals.theta, vals.omega);
-            } */
+            }*/
             Mono::delay(100.millis()).await;
         }
     }
