@@ -1,15 +1,15 @@
-use crate::{MotorParamsEstimate, ControllerParameters};
+use crate::{ControllerParameters, FocFault, MotorParamsEstimate};
 use libm::{cosf, expf, powf, sinf};
 use num_complex::{Complex32};
 
-#[derive(Clone, Copy, defmt::Format)]
+#[derive(Clone, Copy, defmt::Format, Debug)]
 pub enum PITuningFault {
     Unstable,
     InfeasibleMotorParameters,
     MissingMotorParameters
 }
 
-#[derive(Clone, Copy, defmt::Format)]
+#[derive(Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
 pub struct PIGains {
     /// Set point filter "gain" (1 / time constant)
     pub kr: f32,
@@ -22,7 +22,7 @@ pub struct PIGains {
 }
 
 pub struct PIController {
-    gains: PIGains,
+    gains: Option<PIGains>,
     integral_term: f32,
     prev_reference: f32,
     prev_rf: f32,
@@ -30,7 +30,7 @@ pub struct PIController {
 }
 
 impl PIController {
-    pub fn new(gains: PIGains, sampling_time_s: f32) -> Self {
+    pub fn new(gains: Option<PIGains>, sampling_time_s: f32) -> Self {
         Self {
             gains,
             integral_term: 0.0,
@@ -40,29 +40,32 @@ impl PIController {
         }
     }
 
-    pub fn compute(&mut self, reference: f32, measurement: f32, saturation_error: f32) -> f32 {
+    pub fn compute(&mut self, reference: f32, measurement: f32, saturation_error: f32) -> Result<f32, FocFault> {
+        let gains = self.gains.ok_or(FocFault::MissingControllerGains)?;
+
         // Setpoint filter:
-        let r_f = self.gains.kr*self.prev_rf + (1.0-self.gains.kr)*self.prev_reference;
+        let r_f = gains.kr*self.prev_rf + (1.0-gains.kr)*self.prev_reference;
         let e = r_f - measurement;
         self.prev_reference = reference;
         self.prev_rf = r_f;
         // P:
-        let proportional = self.gains.kp * e;
+        let proportional = gains.kp * e;
         // I:
-        let anti_windup_term = self.gains.kt * saturation_error;
-        self.integral_term = (
-            self.integral_term 
-            + self.sampling_time_s * self.gains.ki * (e + anti_windup_term)
-        ).clamp(-1000.0, 1000.0); // Clamp just to avoid NaN's in worst case
-        
-        proportional + self.integral_term
+        let anti_windup_term = gains.kt * saturation_error;
+        let integral_accum = self.sampling_time_s * gains.ki * (e + anti_windup_term);
+        if !integral_accum.is_finite() {
+            return Err(FocFault::NumericalError);
+        }
+        self.integral_term += integral_accum;
+
+        Ok(proportional + self.integral_term)
     }
 
-    pub fn get_gains(&self) -> PIGains {
+    pub fn get_gains(&self) -> Option<PIGains> {
         self.gains
     }
 
-    pub fn set_gains(&mut self, gains: PIGains) {
+    pub fn set_gains(&mut self, gains: Option<PIGains>) {
         self.gains = gains;
     }
 

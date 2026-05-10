@@ -80,9 +80,11 @@ pub struct FocInput {
     pub phase_currents: PhaseValues,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, defmt::Format, Debug)]
 pub enum FocFault {
-    MissingMotorParams 
+    MissingMotorParams,
+    MissingControllerGains,
+    NumericalError
 }
 
 #[derive(Clone, Copy)]

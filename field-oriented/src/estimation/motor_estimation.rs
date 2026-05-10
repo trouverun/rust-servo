@@ -451,11 +451,11 @@ mod test {
             if estimator.should_unwind_controller() {
                 foc.clear_windup();
                 estimator.acnkowledge_unwind_request();
-            }else if estimator.should_tune_controller() {
+            } else if estimator.should_tune_controller() {
                 let pi_gains = compute_current_pi_controller_gains::<50>(
                     estimator.get_estimate(), pwm_freq_hz
                 ).expect("Failed to tune PI controller");
-                foc.set_pi_gains(pi_gains);
+                foc.set_pi_gains(Some(pi_gains));
                 estimator.acknowledge_tuning_request();
             }
 

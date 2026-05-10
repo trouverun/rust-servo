@@ -88,21 +88,23 @@ impl HallCalibrator {
             CalibrationState::SweepingReverse { target_theta, first_edge, prev_pattern, num_edges} => {
                 if *prev_pattern != hall_pattern {
                     if let Some(first_pattern) = first_edge {
+                        // In forward mode we recorded the angle of arrival to edge X,
+                        // so here we have to record the angle of departure from X to remain consistent
+                        let idx = ((*prev_pattern).clamp(1, 6) - 1) as usize;
+                        // Average out the angles from forward and reverse:
+                        self.hall_pattern_to_theta[idx] += *target_theta;
+                        self.hall_pattern_to_theta[idx] /= 2.0;
+                        *num_edges += 1;
+
                         if *first_pattern == hall_pattern && *num_edges >= 5 {
                             let theta = *target_theta;
                             self.state = CalibrationState::Done { target_theta: theta };
                             return theta;
-                        }
+                        };
+                        
                     } else {
                         *first_edge = Some(hall_pattern);
                     }
-                    // In forward mode we recorded the angle of arrival to edge X,
-                    // so here we have to record the angle of departure from X to remain consistent
-                    let idx = ((*prev_pattern).clamp(1, 6) - 1) as usize;
-                    // Average out the angles from forward and reverse:
-                    self.hall_pattern_to_theta[idx] += *target_theta;
-                    self.hall_pattern_to_theta[idx] /= 2.0;
-                    *num_edges += 1;
                 }
                 *prev_pattern = hall_pattern;
 

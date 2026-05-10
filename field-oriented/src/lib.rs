@@ -27,7 +27,7 @@ pub use crate::sim::*;
 pub use crate::test_utils::*;
 
 
-#[derive(Clone, Copy, defmt::Format)]
+#[derive(Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
 pub struct ControllerParameters {
     pub d_pi: PIGains,
     pub q_pi: PIGains
@@ -48,13 +48,12 @@ impl FOC {
 
         // Slow I controller for calibration steady-state use:
         let calibration_gains = PIGains { kr: 0.0, kp: 0.0, ki: 1.0, kt: 1.0 };
-        let calibration_d_pi = PIController::new(calibration_gains, sampling_time_s);
-        let calibration_q_pi = PIController::new(calibration_gains, sampling_time_s);
+        let calibration_d_pi = PIController::new(Some(calibration_gains), sampling_time_s);
+        let calibration_q_pi = PIController::new(Some(calibration_gains), sampling_time_s);
 
         // Normal use:
-        let zero_gains = PIGains { kr: 0.0, kp: 0.0, ki: 0.0, kt: 0.0 };
-        let d_pi = PIController::new(zero_gains, sampling_time_s);
-        let q_pi = PIController::new(zero_gains, sampling_time_s);
+        let d_pi = PIController::new(None, sampling_time_s);
+        let q_pi = PIController::new(None, sampling_time_s);
 
         Self {
             config,
@@ -86,7 +85,10 @@ impl FOC {
             FocInputType::CalibrationCurrents(target_i_dq) => {
                 let u_d = self.calibration_d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
                 let u_q = self.calibration_q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
-                (ClarkParkValue { d: u_d, q: u_q }, target_i_dq)
+                (ClarkParkValue { 
+                    d: u_d?, 
+                    q: u_q? 
+                }, target_i_dq)
             }
             FocInputType::TargetCurrents(target_i_dq) => {
                 self.compute_voltages(target_i_dq, measured_i_dq, omega_e, 0.0, motor_params)?
@@ -157,8 +159,8 @@ impl FOC {
         target_i_dq: ClarkParkValue, measured_i_dq: ClarkParkValue, 
         omega_e: f32, pm_flux_linkage: f32, motor_params: MotorParamsEstimate
     ) -> Result<(ClarkParkValue, ClarkParkValue), FocFault> {
-        let mut u_d = self.d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d);
-        let mut u_q = self.q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q);
+        let mut u_d = self.d_pi.compute(target_i_dq.d, measured_i_dq.d, self.u_dq_saturation.d)?;
+        let mut u_q = self.q_pi.compute(target_i_dq.q, measured_i_dq.q, self.u_dq_saturation.q)?;
         // Cross-coupling compensation feedforward:
         let q_inductance = motor_params.q_inductance.ok_or(FocFault::MissingMotorParams)?;
         u_d += -q_inductance*measured_i_dq.q*omega_e;
@@ -168,15 +170,24 @@ impl FOC {
         Ok((ClarkParkValue { d: u_d, q: u_q }, target_i_dq))
     }
 
-    pub fn set_pi_gains(&mut self, gains: ControllerParameters) {
-        self.d_pi.set_gains(gains.d_pi);
-        self.q_pi.set_gains(gains.q_pi);
+    pub fn set_pi_gains(&mut self, gains: Option<ControllerParameters>) {
+        if let Some(ControllerParameters { d_pi, q_pi }) = gains {
+            self.d_pi.set_gains(Some(d_pi));
+            self.q_pi.set_gains(Some(q_pi));
+        } else {
+            self.d_pi.set_gains(None);
+            self.q_pi.set_gains(None);
+        }
     }
 
-    pub fn get_pi_gains(&self) -> ControllerParameters {
-        ControllerParameters {
-            d_pi: self.d_pi.get_gains(),
-            q_pi: self.q_pi.get_gains()
+    pub fn get_pi_gains(&self) -> Option<ControllerParameters> {
+        if let (Some(d_pi), Some(q_pi)) = (self.d_pi.get_gains(), self.q_pi.get_gains()) {
+            Some(ControllerParameters {
+                d_pi,
+                q_pi
+            })
+        } else {
+            None
         }
     }
 
@@ -217,10 +228,10 @@ mod tests {
             }
         );
 
-        if let Some(gains) = compute_current_pi_controller_gains::<50>(
+        if let Ok(gains) = compute_current_pi_controller_gains::<50>(
             motor_params, pwm_freq_hz
         ) {
-            foc.set_pi_gains(gains);
+            foc.set_pi_gains(Some(gains));
         } else {
             assert!(false, "Couldn't tune controller")
         }

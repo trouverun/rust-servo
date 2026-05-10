@@ -17,7 +17,7 @@ pub struct MotorParams {
     pub pm_flux_linkage: f32,
 }
 
-#[derive(Clone, Copy, defmt::Format)]
+#[derive(Clone, Copy, defmt::Format, serde::Serialize, serde::Deserialize)]
 pub struct MotorParamsEstimate {
     pub num_pole_pairs: Option<u8>,
     pub stator_resistance: Option<f32>,
