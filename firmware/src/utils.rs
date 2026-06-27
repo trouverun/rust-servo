@@ -126,6 +126,18 @@ impl FeedbackArbitrator {
     pub fn get_hall_pattern(&self) -> u8 {
         self.hall_pattern
     }
+
+    pub fn read_hall(&self) -> Option<Result<RotorFeedback, RotorFeedbackFault>> {
+        self.hall_feedback
+    }
+
+    pub fn read_encoder(&self) -> Option<Result<RotorFeedback, RotorFeedbackFault>> {
+        self.encoder_feedback
+    }
+
+    pub fn read_sensorless(&self) -> Option<Result<RotorFeedback, RotorFeedbackFault>> {
+        self.sensorless_feedback
+    }
 }
 
 impl HasRotorFeedback for FeedbackArbitrator {

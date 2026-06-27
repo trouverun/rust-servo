@@ -9,7 +9,7 @@ use embassy_stm32::Config as RccConfig;
 use embassy_stm32::timer::low_level::Timer;
 use embassy_stm32::{comp::*};
 use embassy_stm32::dac::Ch2;
-use embassy_stm32::dac::{Dac, DacCh2};
+use embassy_stm32::dac::{Dac, DacCh1, DacCh2};
 use embassy_stm32::exti::{ExtiInput, TriggerEdge};
 use embassy_stm32::gpio::{Level, Output, Pull, Speed};
 use embassy_stm32::mode::Blocking;

@@ -1,0 +1,34 @@
+VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_: Hyperdrive Host
+
+BO_ 256 MotorCurrents: 8 Hyperdrive
+ SG_ iQ_meas : 0|16@1- (0.001,0) [-32.768|32.767] "A" Host
+ SG_ iD_meas : 16|16@1- (0.001,0) [-32.768|32.767] "A" Host
+ SG_ iQ_target : 32|16@1- (0.001,0) [-32.768|32.767] "A" Host
+ SG_ iD_target : 48|16@1- (0.001,0) [-32.768|32.767] "A" Host
+
+BO_ 257 RotorEstimates: 8 Hyperdrive
+ SG_ hall_pos : 0|12@1+ (0.0015339808,0) [0|6.2817] "rad" Host
+ SG_ sensl_pos : 12|14@1+ (0.00038349519,0) [0|6.2829] "rad" Host
+ SG_ hall_vel : 26|16@1- (0.25,0) [-8192|8191.75] "rad/s" Host
+ SG_ sensl_vel : 42|16@1- (0.25,0) [-8192|8191.75] "rad/s" Host
+ SG_ hall_valid : 58|1@1+ (1,0) [0|1] "" Host
+ SG_ sensl_valid : 59|1@1+ (1,0) [0|1] "" Host
+
+BO_ 258 EncoderReading: 4 Hyperdrive
+ SG_ enc_pos : 0|12@1+ (0.0015339808,0) [0|6.2817] "rad" Host
+ SG_ enc_vel : 12|16@1- (0.25,0) [-8192|8191.75] "rad/s" Host
+ SG_ enc_valid : 28|1@1+ (1,0) [0|1] "" Host
+
+BA_DEF_ BO_  "GenMsgCycleTime" INT 0 10000;
+BA_DEF_ BO_  "GenMsgCycleTimeUs" INT 0 1000000;
+BA_DEF_DEF_  "GenMsgCycleTime" 0;
+BA_DEF_DEF_  "GenMsgCycleTimeUs" 0;
+BA_ "GenMsgCycleTimeUs" BO_ 256 400;
+BA_ "GenMsgCycleTimeUs" BO_ 257 1000;
+BA_ "GenMsgCycleTimeUs" BO_ 258 1000;

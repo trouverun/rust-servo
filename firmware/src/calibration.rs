@@ -1,13 +1,12 @@
 use crate::boards::PWM_FREQ;
 use crate::types::{CalibrationPhase, CalibrationRunner, FaultCause};
 use field_oriented::{
-    ClarkParkValue, EstimationStepFault, FocInputType, HallCalibrator, MotorParamEstimator,
-    MotorParamsEstimate, OfflineEstimatorConfig, OfflineEstimatorInput, OfflineEstimatorOutput,
-    OfflineMotorEstimator,
+    AngleType, ClarkParkValue, EstimationStepFault, FocInputType, HallCalibrator, MotorParamEstimator, MotorParamsEstimate, OfflineEstimatorConfig, OfflineEstimatorInput, OfflineEstimatorOutput, OfflineMotorEstimator,
 };
 
 pub struct CalibrationInputs {
     pub dc_bus_voltage: f32,
+    pub angle_type: AngleType,
     pub theta: f32,
     pub hall_pattern: u8,
     pub target_voltage: f32,
@@ -17,6 +16,7 @@ pub struct CalibrationInputs {
 
 /// Outputs needed regardless of stage
 pub struct CalibrationOutput {
+    pub angle_type: AngleType,
     pub theta: f32,
     pub foc_command: FocInputType,
 }
@@ -69,6 +69,7 @@ impl CalibrationRunner {
                 *duration_waited_s += DT;
                 let mut result = None;
                 let output = CalibrationOutput {
+                    angle_type: AngleType::Electrical,
                     theta: 0.0,
                     foc_command: FocInputType::CalibrationCurrents(ClarkParkValue {
                         d: inputs.target_current,
@@ -100,6 +101,7 @@ impl CalibrationRunner {
                     const PWM_FREQ_HZ: u32 = PWM_FREQ.0;
                     let theta = self.hall_calibrator.calibration_step::<PWM_FREQ_HZ>(inputs.hall_pattern, inputs.target_omega);
                     let output = CalibrationOutput {
+                    angle_type: AngleType::Electrical,
                         theta,
                         foc_command: FocInputType::CalibrationCurrents(ClarkParkValue {
                             d: inputs.target_current,
@@ -162,6 +164,7 @@ impl CalibrationRunner {
             OfflineEstimatorOutput::Current(i_dq) => FocInputType::TargetCurrents(i_dq),
         };
         CalibrationOutput {
+            angle_type: inputs.angle_type,
             theta: estimator_command.theta,
             foc_command,
         }
@@ -169,6 +172,7 @@ impl CalibrationRunner {
 
     fn idle_output(&self, inputs: CalibrationInputs) -> CalibrationOutput {
         CalibrationOutput {
+            angle_type: inputs.angle_type,
             theta: inputs.theta,
             foc_command: FocInputType::CalibrationVoltage(ClarkParkValue { d: 0.0, q: 0.0 }),
         }

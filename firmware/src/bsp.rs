@@ -1,6 +1,7 @@
 use crate::boards::*;
 use crate::memory::{sector_offset, Stored, MemoryFault, CRC32, MAX_RECORD_BYTES, SECTOR_SIZE};
 use crate::utils::{wrap_to_pi, LowPassFilter};
+use core::cell::SyncUnsafeCell;
 use core::f32::consts::{PI, TAU};
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use embassy_stm32::adc::{
@@ -700,7 +701,7 @@ impl CanBus {
 }
 
 /// Where the Encoder SPI RX DMA channel circularly deposits the two response bytes
-static mut RX_BUF: [u8; 2] = [0xDE, 0xAD];
+static RX_BUF: SyncUnsafeCell<[u8; 2]> = SyncUnsafeCell::new([0xDE, 0xAD]);
 /// AMT22 command bytes for the Encoder SPI TX DMA channels
 static TX1_BYTE: AtomicU8 = AtomicU8::new(0x00);
 static TX2_BYTE: AtomicU8 = AtomicU8::new(0x00);
@@ -767,7 +768,7 @@ impl AmtEncoder {
         let cs_high: &'static u32 = unsafe { &*CS_HIGH.as_ptr() };
 
         // SAFETY: DMA not running yet
-        let rx_buf: &'static mut [u8] = unsafe { &mut *core::ptr::addr_of_mut!(RX_BUF) };
+        let rx_buf: &'static mut [u8] = unsafe { &mut *RX_BUF.get() };
         let tx1_byte: &'static u8 = unsafe { &*TX1_BYTE.as_ptr() };
         let tx2_byte: &'static u8 = unsafe { &*TX2_BYTE.as_ptr() };
 
@@ -827,10 +828,8 @@ impl AmtEncoder {
         self.rx_channel.clear_complete_flag();
 
         let (b0, b1) = unsafe {
-            (
-                core::ptr::read_volatile(core::ptr::addr_of!(RX_BUF[0])),
-                core::ptr::read_volatile(core::ptr::addr_of!(RX_BUF[1])),
-            )
+            let p = RX_BUF.get() as *const u8;
+            (core::ptr::read_volatile(p), core::ptr::read_volatile(p.add(1)))
         };
         let raw = (u16::from(b0) << 8) | u16::from(b1);
 
@@ -892,9 +891,9 @@ pub struct Watchdog {
 }
 
 impl Watchdog {
-    pub fn new(mappings: WatchdogMappings) -> Self {
+    pub fn new(mappings: WatchdogMappings, frequency: Hertz) -> Self {
         let timer = mappings.timer;
-        timer.set_frequency(Hertz((0.9*PWM_FREQ.0 as f32) as u32), embassy_stm32::timer::low_level::RoundTo::Slower);
+        timer.set_frequency(frequency ,embassy_stm32::timer::low_level::RoundTo::Slower);
         timer.generate_update_event();
         timer.clear_update_interrupt();
         timer.enable_update_interrupt(true);
