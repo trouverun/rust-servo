@@ -7,6 +7,7 @@ edition = "2024"
 num-complex = { version = "0.4", default-features = false, features = ["libm"] }
 libm = { version = "0.2", default-features = false }
 defmt = { version = "0.3", features = ["encoding-rzcobs"] }
+serde = { version = "1", default-features = false, features = ["derive"] }
 
 [dev-dependencies]
 plotly = "0.10"

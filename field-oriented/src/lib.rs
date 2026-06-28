@@ -16,7 +16,7 @@ pub use crate::types::*;
 use crate::{math::*};
 pub use crate::pi_control::{PIController, PIGains, PITuningFault, compute_current_pi_controller_gains};
 pub use crate::estimation::{
-    ConstantMotorParameters, HallCalibrator, OfflineMotorEstimator, OfflineEstimatorInput,
+    ConstantMotorParameters, HallCalibrator, HallCalibrationFault, OfflineMotorEstimator, OfflineEstimatorInput,
     OfflineEstimatorCommand, OfflineEstimatorOutput, OfflineEstimatorConfig,
     MotorParams, MotorParamsEstimate, MotorParamEstimator, EstimationStepFault
 };

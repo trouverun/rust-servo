@@ -1,5 +1,22 @@
 use core::f32::consts::PI;
 
+#[derive(Clone, Copy, defmt::Format, Debug)]
+pub enum HallCalibrationFault {
+    EdgeDisagreement,
+}
+
+/// Smallest signed difference `a - b` mapped to `(-PI, PI]`
+fn wrapped_diff(a: f32, b: f32) -> f32 {
+    let d = a - b;
+    if d > PI {
+        d - 2.0 * PI
+    } else if d < -PI {
+        d + 2.0 * PI
+    } else {
+        d
+    }
+}
+
 enum CalibrationState {
     InitialSettle { waited_s: f32 },
     SweepingForward {
@@ -41,7 +58,7 @@ impl HallCalibrator {
     /// Increment the target rotor angle continuously each FOC iteration
     pub fn calibration_step<const PWM_FREQ: u32>(
         &mut self, hall_pattern: u8, omega: f32
-    ) -> f32 {
+    ) -> Result<f32, HallCalibrationFault> {
         let dt: f32 = 1.0 / PWM_FREQ as f32;
         match &mut self.state {
             CalibrationState::InitialSettle { waited_s } => {
@@ -54,7 +71,7 @@ impl HallCalibrator {
                         num_edges: 0
                     };
                 }
-                0.0
+                Ok(0.0)
             }
             CalibrationState::SweepingForward { target_theta, first_edge, prev_pattern, num_edges} => {
                 if *prev_pattern != hall_pattern {
@@ -66,8 +83,8 @@ impl HallCalibrator {
                                 first_edge: None,
                                 prev_pattern: hall_pattern,
                                 num_edges: 0
-                            };                            
-                            return theta;
+                            };
+                            return Ok(theta);
                         }
                     } else {
                         *first_edge = Some(hall_pattern);
@@ -83,7 +100,7 @@ impl HallCalibrator {
                     *target_theta -= 2.0*PI;
                 }
 
-                return *target_theta
+                Ok(*target_theta)
             }
             CalibrationState::SweepingReverse { target_theta, first_edge, prev_pattern, num_edges} => {
                 if *prev_pattern != hall_pattern {
@@ -91,17 +108,30 @@ impl HallCalibrator {
                         // In forward mode we recorded the angle of arrival to edge X,
                         // so here we have to record the angle of departure from X to remain consistent
                         let idx = ((*prev_pattern).clamp(1, 6) - 1) as usize;
-                        // Average out the angles from forward and reverse:
-                        self.hall_pattern_to_theta[idx] += *target_theta;
-                        self.hall_pattern_to_theta[idx] /= 2.0;
+
+                        // If the forward and reverse values differ significantly, reject the calibration:
+                        let forward = self.hall_pattern_to_theta[idx];
+                        let disagreement = wrapped_diff(*target_theta, forward);
+                        if disagreement.abs() > PI / 6.0 {
+                            return Err(HallCalibrationFault::EdgeDisagreement);
+                        }
+
+                        // Assign the circular mean of reverse and forward as the edge location:
+                        let mut mean: f32 = forward + 0.5 * disagreement;
+                        if mean < 0.0 {
+                            mean += 2.0 * PI;
+                        } else if mean >= 2.0 * PI {
+                            mean -= 2.0 * PI;
+                        }
+                        self.hall_pattern_to_theta[idx] = mean;
                         *num_edges += 1;
 
                         if *first_pattern == hall_pattern && *num_edges >= 5 {
                             let theta = *target_theta;
                             self.state = CalibrationState::Done { target_theta: theta };
-                            return theta;
+                            return Ok(theta);
                         };
-                        
+
                     } else {
                         *first_edge = Some(hall_pattern);
                     }
@@ -113,9 +143,9 @@ impl HallCalibrator {
                     *target_theta += 2.0*PI;
                 }
 
-                return *target_theta
+                Ok(*target_theta)
             }
-            CalibrationState::Done {target_theta } => *target_theta,
+            CalibrationState::Done {target_theta } => Ok(*target_theta),
         }
     }
 
@@ -164,7 +194,7 @@ mod test {
         let mut records: std::vec::Vec<SimRecord> = std::vec::Vec::new();
         while !calibrator.check_calibration_done() {
             let pattern = state.hall_pattern.unwrap();
-            let theta = calibrator.calibration_step::<20_000>(pattern, 0.43);
+            let theta = calibrator.calibration_step::<20_000>(pattern, 0.43).unwrap();
 
             let foc_input = FocInput {
                 dc_bus_voltage: 24.0,
